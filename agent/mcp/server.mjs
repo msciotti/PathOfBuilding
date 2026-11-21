@@ -36,6 +36,18 @@ const TOOLS = [
   { name: "pob_what_if", method: "what_if",
     description: "Evaluate hypothetical mod text on the open build using PoB's own calc engine, without changing the build. Pass mod lines as they appear in game (e.g. 'Cannot be Poisoned', '+50 to maximum Life'); returns before/after for every stat that changed. Optionally filter with `stats`.",
     inputSchema: { type: "object", properties: { mods: strs, stats: strs }, required: ["mods"] } },
+  { name: "pob_chat_wait", method: "chat_wait",
+    description: "Wait for the user to send a message in Path of Building's Agent tab. Blocks up to `timeout` seconds (default 50) and returns the new messages plus the open build's name; on timeout returns timedOut=true, so call it again to keep listening. To serve the in-app chat, loop: pob_chat_wait -> investigate with the other pob_* tools -> pob_chat_reply -> pob_chat_wait.",
+    inputSchema: { type: "object", properties: { timeout: int } } },
+  { name: "pob_chat_reply", method: "chat_reply",
+    description: "Post your answer in Path of Building's Agent tab. Plain text; newlines are kept and long lines wrap. No markdown rendering, so keep lists simple ('- item').",
+    inputSchema: { type: "object", properties: { text: str }, required: ["text"] } },
+  { name: "pob_chat_status", method: "chat_status",
+    description: "Show a short progress line under the Agent tab transcript while you work (e.g. 'Ranking boot mods by chaos max hit...'). Cleared automatically by pob_chat_reply; pass empty text to clear it yourself.",
+    inputSchema: { type: "object", properties: { text: str }, required: ["text"] } },
+  { name: "pob_chat_history", method: "chat_history",
+    description: "Full Agent tab transcript (user and agent messages) for context, e.g. when you connect to a chat already in progress.",
+    inputSchema: { type: "object", properties: {} } },
 ];
 
 const server = new Server({ name: "pob-agent", version: "0.1.0" }, { capabilities: { tools: {} } });

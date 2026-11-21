@@ -98,6 +98,13 @@ end
 
 function methods.ping() return { ok = true, buildLoaded = env().build ~= nil } end
 
+-- Same as pressing F5 in dev mode: reloads all Lua in-process. Unsaved build changes are lost.
+function methods.restart()
+	if not (launch and launch.devMode) then return { error = "restart requires dev mode" } end
+	launch.doRestart = "Restarting..."
+	return { restarting = true }
+end
+
 function methods.list_sources()
 	return { sources = AgentData.listSources(getIndex()) }
 end
@@ -384,6 +391,73 @@ function methods.effect_stats(p)
 	return { probed = c, noEffect = noeff, errors = errs, statsMoved = statCounts }
 end
 
+-- Chat: the in-app Agent tab queues user messages here; an external agent long-polls chat_wait and answers
+-- with chat_reply. State lives on `launch` so it survives `reload` (which swaps this module's upvalues).
+local function chat()
+	if not launch.agentChat then
+		launch.agentChat = { messages = {}, delivered = 0, lastSeen = 0, waiting = 0 }
+	end
+	return launch.agentChat
+end
+M.chat = chat
+
+function M.chatSend(text)
+	local c = chat()
+	c.messages[#c.messages + 1] = { role = "user", text = text, time = os.time() }
+end
+
+local function undelivered()
+	local c, out = chat(), {}
+	for i = c.delivered + 1, #c.messages do
+		if c.messages[i].role == "user" then out[#out + 1] = c.messages[i].text end
+	end
+	return out
+end
+
+local function buildName()
+	local b = env().build
+	return b and b.buildName
+end
+
+-- params: { timeout = seconds (default 50, max 290) }. Blocks until the user sends something in the Agent tab.
+function methods.chat_wait(p)
+	local c = chat()
+	c.lastSeen = GetTime()
+	local deadline = GetTime() + math.min(tonumber(p.timeout) or 50, 290) * 1000
+	return { _defer = function()
+		local msgs = undelivered()
+		if #msgs == 0 and GetTime() < deadline then return nil end
+		c.lastSeen = GetTime()
+		c.delivered = #c.messages
+		if #msgs == 0 then return { messages = {}, timedOut = true, hint = "No message yet; call chat_wait again." } end
+		c.status = "Thinking..."
+		return { messages = msgs, build = buildName(), hint = "Answer with chat_reply (use chat_status for progress), then call chat_wait again." }
+	end }
+end
+
+-- params: { text = "..." }. Shows the agent's answer in the Agent tab.
+function methods.chat_reply(p)
+	local c = chat()
+	if type(p.text) ~= "string" or p.text == "" then return { error = "text required" } end
+	c.lastSeen = GetTime()
+	c.messages[#c.messages + 1] = { role = "agent", text = p.text, time = os.time() }
+	c.delivered = #c.messages
+	c.status = nil
+	return { ok = true }
+end
+
+-- params: { text = "..." }. Short progress line under the transcript, e.g. "Ranking boot mods...". Empty clears it.
+function methods.chat_status(p)
+	local c = chat()
+	c.lastSeen = GetTime()
+	c.status = (type(p.text) == "string" and p.text ~= "") and p.text or nil
+	return { ok = true }
+end
+
+function methods.chat_history()
+	return { messages = chat().messages, build = buildName() }
+end
+
 local function handle(line)
 	local req = json.decode(line)
 	if type(req) ~= "table" then return { error = "bad json" } end
@@ -391,12 +465,27 @@ local function handle(line)
 	if not fn then return { id = req.id, error = "unknown method: " .. tostring(req.method) } end
 	local ok, res = pcall(fn, req.params or {})
 	if not ok then return { id = req.id, error = tostring(res) } end
+	-- A method can defer its answer: _defer is polled each frame until it returns a result.
+	if type(res) == "table" and type(res._defer) == "function" then return { id = req.id, defer = res._defer } end
 	return { id = req.id, result = res }
 end
 M.handle = handle
 
 local server, clients = nil, {}
+local keepAlive, lastInput = nil, 0
+
+-- SimpleGraphic skips OnFrame while the window is unfocused and the cursor is elsewhere, unless a
+-- coroutine is suspended. Keep one suspended so requests are served in the background.
+local function keepAwake()
+	if not keepAlive or coroutine.status(keepAlive) == "dead" then
+		keepAlive = coroutine.create(function() while true do coroutine.yield() end end)
+		coroutine.resume(keepAlive)
+	end
+end
+
 function M.start()
+	-- Must exist before the first frame, or a restart while PoB is in the background never gets one
+	keepAwake()
 	local socket = require("socket")
 	server = socket.tcp4()
 	server:setoption("reuseaddr", true)
@@ -404,32 +493,69 @@ function M.start()
 	if not ok then ConPrintf("AgentBridge: bind failed: %s", tostring(err)) server = nil return end
 	server:listen(4)
 	server:settimeout(0)
+	-- Record user input so poll() can tell when PoB is in use.
+	for _, name in ipairs({ "OnKeyDown", "OnKeyUp", "OnChar" }) do
+		local orig = launch[name]
+		launch[name] = function(...) lastInput = GetTime() return orig(...) end
+	end
 	ConPrintf("AgentBridge listening on 127.0.0.1:%d", M.port)
+end
+
+-- True when nobody appears to be using the window: cursor outside it and no recent key input.
+local function userIdle()
+	local x, y = GetCursorPos()
+	local w, h = GetScreenSize()
+	local over = x >= 0 and y >= 0 and x < w and y < h
+	return not over and GetTime() - lastInput > 2000
 end
 
 function M.poll()
 	if not server then return end
+	keepAwake()
+	if userIdle() then
+		-- Block briefly instead of rendering at full rate; wakes immediately on a connection or data.
+		local socks = { server }
+		for _, cl in ipairs(clients) do socks[#socks + 1] = cl.sock end
+		require("socket").select(socks, nil, 0.25)
+	end
 	local c = server:accept()
 	if c then c:settimeout(0) clients[#clients + 1] = { sock = c, buf = "" } end
+	local waiting = 0
 	for i = #clients, 1, -1 do
 		local cl = clients[i]
 		local data_, err, partial = cl.sock:receive(65536)
 		local chunk = data_ or partial
 		if chunk and #chunk > 0 then cl.buf = cl.buf .. chunk end
-		while true do
-			local nl = cl.buf:find("\n", 1, true)
-			if not nl then break end
-			local line = cl.buf:sub(1, nl - 1)
-			cl.buf = cl.buf:sub(nl + 1)
-			if #line > 0 then
-				local ok, resp = pcall(handle, line)
-				if not ok then resp = { error = tostring(resp) } end
+		-- Drop closed connections first so a deferred chat_wait can't consume messages for a dead client.
+		while err ~= "closed" do
+			local resp
+			if cl.pending then
+				-- Requests on a connection are answered in order, so later lines wait behind a deferred one.
+				local ok, res = pcall(cl.pending.defer)
+				if not ok then resp = { id = cl.pending.id, error = tostring(res) }
+				elseif res ~= nil then resp = { id = cl.pending.id, result = res } end
+				if not resp then waiting = waiting + 1 break end
+				cl.pending = nil
+			else
+				local nl = cl.buf:find("\n", 1, true)
+				if not nl then break end
+				local line = cl.buf:sub(1, nl - 1)
+				cl.buf = cl.buf:sub(nl + 1)
+				if #line > 0 then
+					local ok
+					ok, resp = pcall(handle, line)
+					if not ok then resp = { error = tostring(resp) } end
+					if resp.defer then cl.pending = resp resp = nil end
+				end
+			end
+			if resp then
 				local okj, s = pcall(json.encode, resp)
 				cl.sock:send((okj and s or '{"error":"encode failed"}') .. "\n")
 			end
 		end
 		if err == "closed" then cl.sock:close() table.remove(clients, i) end
 	end
+	chat().waiting = waiting
 end
 
 return M
