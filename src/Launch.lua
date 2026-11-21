@@ -81,6 +81,10 @@ function launch:OnInit()
 		end
 	end
 
+	do -- agent bridge (personal patch)
+		local ok, agent = pcall(LoadModule, "AgentBridge")
+		if ok and agent then self.agent = agent PCall(agent.start) else ConPrintf("AgentBridge load failed: %s", tostring(agent)) end
+	end
 	if not self.devMode and not firstRunFile then
 		-- Run a background update check if developer mode is off
 		self:CheckForUpdate(true)
@@ -107,6 +111,7 @@ function launch:OnExit()
 end
 
 function launch:OnFrame()
+	if self.agent then PCall(self.agent.poll) end
 	if self.main then
 		if self.main.OnFrame then
 			local errMsg = PCall(self.main.OnFrame, self.main)
