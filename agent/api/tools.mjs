@@ -14,6 +14,25 @@ export function rpc(method, params = {}) {
   });
 }
 
+// One trade search per proposed item, run one after another (the trade API is rate limited). A failed search leaves
+// that item unpriced rather than failing the proposal.
+async function fillResists({ price = true, ...params }) {
+  const r = await rpc("fill_resists", params);
+  const result = r.error ? { error: r.error } : r.result;
+  if (result.error) throw new Error(result.error);
+  if (price) {
+    for (const item of result.items) {
+      try {
+        const { league, total, cheapest, median, sampled, mapped } = await tradeSearch(item.tradeQuery);
+        item.price = { league, total, cheapest, median, sampled, mapped: mapped.map((m) => m.statText) };
+      } catch (e) {
+        item.price = { error: e.message };
+      }
+    }
+  }
+  return result;
+}
+
 const str = { type: "string" }, int = { type: "integer" }, strs = { type: "array", items: str };
 export const TOOLS = [
   { name: "pob_list_sources", method: "list_sources",
@@ -49,6 +68,12 @@ export const TOOLS = [
   { name: "pob_list_stats", method: "list_stats",
     description: "List PoB's calculated output stat names for the open build with current values (and the sidebar label where one exists). Filter with `query` (e.g. 'avoid', 'maxhit', 'resist', 'dps'). Use these names as goals/stats in other tools.",
     inputSchema: { type: "object", properties: { query: str } } },
+  { name: "pob_design_rare", method: "design_rare",
+    description: "Build a rare item that can exist, from PoB's data: the base with its normal implicit, and each mod checked against that base's mod pool (spawn weights, influences, item level), at most 3 prefixes and 3 suffixes, one mod per mod group. Mods are written as in game with the number optional ('+# to maximum Life', '+45 to Strength': a number picks the tier that rolls it), or as {text, tier, roll, crafted}; tier 1 is the best tier the base has, and the default is the best the item level allows. `roll` (max, mid, min or 0-1; default mid) places the roll inside the tier. A `crafted` mod comes from the crafting bench and needs an open affix (one per item). Impossible mods are rejected with a reason ('can't roll on boots', '4th prefix') and nothing is built. Returns the item text, the mods with their tiers, the open affixes, `modLines` (the rolled mod lines, for what_if) and, when `slot` is given, `change`: a compare_variants change that equips the item (or use the item text as an `equip` change's `item`). `tradeQuery` can be passed straight to trade_search to price the item (mod minimums are the tier floors). Default item level is 86.",
+    inputSchema: { type: "object", properties: { slot: str, base: str, mods: { type: "array", items: { oneOf: [str, { type: "object", properties: { text: str, tier: int, roll: { oneOf: [{ type: "string", enum: ["max", "mid", "min"] }, { type: "number" }] }, crafted: { type: "boolean" } }, required: ["text"] }] } }, influences: { type: "array", items: { type: "string", enum: ["shaper", "elder", "crusader", "redeemer", "hunter", "warlord"] } }, roll: { oneOf: [{ type: "string", enum: ["max", "mid", "min"] }, { type: "number" }] }, ilvl: int }, required: ["base", "mods"] } },
+  { name: "pob_fill_resists", run: fillResists,
+    description: "Propose rares for the chosen slots (e.g. both rings and boots; what is equipped there now is replaced) that cap fire, cold and lightning resistance given the rest of the gear, then spend the remaining affixes on `spend` mods (default maximum Life and Strength; pass others for the stats the build scales). Resists are placed first, so Strength can lose a suffix when the gap is large (see `notes`). Bases default to the item now in the slot; give `bases` for an empty slot. Proposals assume tier 2 and mid-high rolls, as is common on trade. Returns one pob_design_rare item per slot (with its `change`), `variant` (ready for compare_variants), the resist totals, the build's key stats before and after with the change and feasibility `warnings` (recalculated by PoB with the items equipped), and, unless `price` is false, each item's trade price (one trade_search per item: total listings, cheapest, median). The build itself is not changed.",
+    inputSchema: { type: "object", properties: { slots: strs, bases: { type: "object", additionalProperties: str }, spend: strs, ilvl: int, stats: strs, price: { type: "boolean" } }, required: ["slots"] } },
   { name: "price_lookup", run: priceLookup,
     description: "Price items from poe.ninja: uniques (by variant/links), skill gems (level, quality, corrupted) and currency, in chaos and divines with the listing count. Names poe.ninja doesn't list (e.g. Awakener's Orb) fall back to the trade site's currency exchange, quoted as cheapest and median of the cheapest ~10 offers. Each name is a string or an object with filters. Defaults to the current challenge league. Not tied to the open build.",
     inputSchema: { type: "object", properties: { names: { type: "array", items: { oneOf: [str, { type: "object", properties: { name: str, links: int, variant: str, level: int, quality: int, corrupted: { type: "boolean" } }, required: ["name"] }] } }, league: str }, required: ["names"] } },

@@ -1577,6 +1577,416 @@ function methods.compare_variants(p)
 	return { baseline = base, variants = rows }
 end
 
+-- Rare item design: items are built from PoB's own mod pools (Item:CanHaveMod) and written back with BuildRaw, so the
+-- text is what PoB's crafting UI produces and compare_variants' `equip` takes it as is.
+local DEFAULT_ILVL = 86
+local ROLLS = { max = 1, mid = 0.5, min = 0 }
+local INFLUENCE_KEYS = { shaper = "Shaper", elder = "Elder", crusader = "Crusader", redeemer = "Redeemer", hunter = "Hunter", warlord = "Warlord" }
+local INFLUENCE_TAGS = { redeemer = "eyrie", hunter = "basilisk", warlord = "adjudicator" }
+-- Proposals assume what is common on trade: the second best tier, rolled 70% of the way up its range.
+local PROPOSAL_TIER, PROPOSAL_ROLL = 2, 0.7
+local RESIST_TEXT = { Fire = "+#% to Fire Resistance", Cold = "+#% to Cold Resistance", Lightning = "+#% to Lightning Resistance" }
+local MAX_FILL_SLOTS = 6
+
+local function lineTemplate(line)
+	local t = line:gsub("%(%-?[%d%.]+%-%-?[%d%.]+%)", "#"):gsub("%-?%d+%.?%d*", "#"):gsub("^%+", "")
+	return (t:lower():gsub("%s+", " "):match("^%s*(.-)%s*$"))
+end
+
+local function modTemplate(mod)
+	local parts = {}
+	for i, line in ipairs(mod) do parts[i] = lineTemplate(line) end
+	return table.concat(parts, " / ")
+end
+
+local function requestTemplate(text)
+	local parts = {}
+	for part in (text .. " / "):gmatch("(.-) / ") do parts[#parts + 1] = lineTemplate(part) end
+	return table.concat(parts, " / ")
+end
+
+local function ordinal(n)
+	return n .. (n == 1 and "st" or n == 2 and "nd" or n == 3 and "rd" or "th")
+end
+
+local function rolledValue(mod, range)
+	return tonumber(itemLib.applyRange(mod[1], range):match("%-?%d+%.?%d*"))
+end
+
+local function parseRoll(roll)
+	if type(roll) == "number" and roll >= 0 and roll <= 1 then return roll end
+	return ROLLS[roll or "mid"]
+end
+
+-- An unrolled rare of the given base with its normal implicit and no explicit mods, or nil and the reason.
+local function newRare(spec, ilvl)
+	local key = tostring(spec.base):lower()
+	local baseName
+	for name in pairs(data.itemBases) do
+		if name:lower() == key then baseName = name break end
+	end
+	if not baseName then
+		local close = {}
+		for name in pairs(data.itemBases) do
+			if name:lower():find(key, 1, true) then close[#close + 1] = name end
+		end
+		table.sort(close)
+		return nil, "unknown base '" .. tostring(spec.base) .. "'" .. (#close > 0 and " (did you mean " .. table.concat(close, ", ", 1, math.min(#close, 5)) .. "?)" or "")
+	end
+	local entry = data.itemBases[baseName]
+	if entry.flask or entry.tincture then return nil, baseName .. " can't be a rare item" end
+	local lines = { "Rarity: RARE", "Agent Design", baseName }
+	for _, name in ipairs(spec.influences or {}) do
+		local display = INFLUENCE_KEYS[tostring(name):lower()]
+		if not display then return nil, "unknown influence '" .. tostring(name) .. "'" end
+		lines[#lines + 1] = display .. " Item"
+	end
+	lines[#lines + 1] = "Crafted: true"
+	lines[#lines + 1] = "Item Level: " .. ilvl
+	local implicits = {}
+	for l in (entry.implicit or ""):gmatch("[^\n]+") do implicits[#implicits + 1] = l end
+	lines[#lines + 1] = "Implicits: " .. #implicits
+	for _, l in ipairs(implicits) do lines[#lines + 1] = l end
+	local item = new("Item"):Item(table.concat(lines, "\n"))
+	if not item.base or not item.affixes then return nil, "can't build " .. baseName end
+	return item
+end
+
+local function newContext(spec)
+	local ilvl = tonumber(spec.ilvl) or DEFAULT_ILVL
+	local item, err = newRare(spec, ilvl)
+	if not item then return nil, err end
+	local prefixLimit = item.prefixes.limit or item.affixLimit / 2
+	local suffixLimit = item.suffixes.limit or item.affixLimit / 2
+	return { item = item, spec = spec, ilvl = ilvl, limit = { Prefix = prefixLimit, Suffix = suffixLimit } }
+end
+
+-- Tiers of the one mod group matching `template`, best first, each marked `allowed` when the item level reaches it.
+-- Returns nil and the reason when the item can't have the mod.
+local function findTiers(ctx, template, crafted)
+	local item = ctx.item
+	local exact, partial = {}, {}
+	local function consider(id, mod)
+		if mod.type ~= "Prefix" and mod.type ~= "Suffix" then return end
+		if modTemplate(mod) == template then
+			exact[#exact + 1] = { id = id, mod = mod }
+		elseif #mod > 1 then
+			for _, line in ipairs(mod) do
+				if lineTemplate(line) == template then partial[#partial + 1] = { id = id, mod = mod } break end
+			end
+		end
+	end
+	if crafted then
+		for i, mod in ipairs(data.masterMods) do
+			if mod.types[item.type] then consider(i, mod) end
+		end
+	else
+		for id, mod in pairs(item.affixes) do
+			if not item:CheckIfModIsDelve(mod) then consider(id, mod) end
+		end
+	end
+	local found = #exact > 0 and exact or partial
+	if #found == 0 then return nil, "no such modifier" end
+	local fits = {}
+	for _, c in ipairs(found) do
+		if crafted or item:CanHaveMod(c.mod) then fits[#fits + 1] = c end
+	end
+	if #fits == 0 then
+		for key, display in pairs(INFLUENCE_KEYS) do
+			local tag = item.base.influenceTags and item.base.influenceTags[INFLUENCE_TAGS[key] or key]
+			for _, c in ipairs(found) do
+				if tag and item:CanHaveMod(c.mod, { [tag] = true }) then return nil, "needs " .. display .. " influence" end
+			end
+		end
+		return nil, "can't roll on " .. item.type:lower()
+	end
+	local group = fits[1].mod.group
+	for _, c in ipairs(fits) do
+		if c.mod.group ~= group then return nil, "ambiguous: matches several mod groups, give the full mod text" end
+	end
+	table.sort(fits, function(a, b)
+		if a.mod.level ~= b.mod.level then return a.mod.level > b.mod.level end
+		return tostring(a.id) < tostring(b.id)
+	end)
+	for i, c in ipairs(fits) do
+		c.tier, c.allowed, c.crafted = i, crafted or c.mod.level <= ctx.ilvl, crafted
+	end
+	return fits
+end
+
+local function allowedTiers(tiers)
+	local list = {}
+	for _, t in ipairs(tiers) do
+		if t.allowed then list[#list + 1] = t end
+	end
+	return list
+end
+
+-- Turns one requested mod into a pick ({ id, mod, tier, tiers, range, crafted }), or nil and the rejection reason.
+local function resolveRequest(ctx, req)
+	local text = tostring(req.text or "")
+	local tiers, why = findTiers(ctx, requestTemplate(text), req.crafted)
+	if not tiers then return nil, why end
+	local list = allowedTiers(tiers)
+	if #list == 0 then return nil, "needs item level " .. tiers[#tiers].mod.level .. " (item level is " .. ctx.ilvl .. ")" end
+	local chosen
+	if req.tier then
+		chosen = tiers[tonumber(req.tier)]
+		if not chosen then return nil, "tier " .. tostring(req.tier) .. " doesn't exist (" .. #tiers .. " tiers)" end
+		if not chosen.allowed then return nil, "tier " .. chosen.tier .. " needs item level " .. chosen.mod.level end
+	end
+	local range = parseRoll(req.roll or ctx.spec.roll)
+	if not range then return nil, "roll must be max, mid, min or a number from 0 to 1" end
+	-- A number in the text picks the tier whose range contains it, rolled to exactly that value
+	local value = not text:find("%(") and #list[1].mod == 1 and tonumber(text:match("%-?%d+%.?%d*")) or nil
+	if value then
+		local found
+		for _, t in ipairs(chosen and { chosen } or list) do
+			local lo, hi = t.mod[1]:match("%((%-?[%d%.]+)%-(%-?[%d%.]+)%)")
+			lo, hi = tonumber(lo), tonumber(hi)
+			if lo and hi and value >= math.min(lo, hi) and value <= math.max(lo, hi) then
+				found, range = t, hi == lo and 0.5 or math.floor((value - lo) / (hi - lo) * 10000 + 0.5) / 10000
+				break
+			end
+		end
+		if not found or rolledValue(found.mod, range) ~= value then return nil, "no tier rolls " .. value .. " on this base" end
+		chosen = found
+	end
+	chosen = chosen or list[1]
+	return { id = chosen.id, mod = chosen.mod, tier = chosen.tier, tiers = #tiers, range = range, crafted = req.crafted }
+end
+
+-- Trade stat text and the lowest value for each mod line: the tier's floor, so the query finds items like the design
+-- rather than only ones rolled as high as it.
+local function tradeMods(pick)
+	local out = {}
+	for _, line in ipairs(pick.mod) do
+		local sum, n = 0, 0
+		for lo, hi in line:gmatch("%((%-?[%d%.]+)%-(%-?[%d%.]+)%)") do sum, n = sum + math.min(tonumber(lo), tonumber(hi)), n + 1 end
+		if n == 0 then
+			for v in line:gmatch("%-?%d+%.?%d*") do sum, n = sum + tonumber(v), n + 1 end
+		end
+		local text = line:gsub("%(%-?[%d%.]+%-%-?[%d%.]+%)", "#"):gsub("%-?%d+%.?%d*", "#")
+		out[#out + 1] = { text = text, min = n > 0 and sum / n or nil, type = pick.crafted and "crafted" or nil }
+	end
+	return out
+end
+
+local function buildDesign(ctx, picks)
+	local item = newRare(ctx.spec, ctx.ilvl)
+	local crafted
+	local slots = { Prefix = item.prefixes, Suffix = item.suffixes }
+	local filled = { Prefix = 0, Suffix = 0 }
+	for _, pick in ipairs(picks) do
+		if pick.crafted then
+			crafted = pick
+		else
+			local kind = pick.mod.type
+			filled[kind] = filled[kind] + 1
+			slots[kind][filled[kind]] = { modId = pick.id, range = pick.range }
+		end
+	end
+	item:Craft()
+	if crafted then
+		for _, line in ipairs(crafted.mod) do
+			item.explicitModLines[#item.explicitModLines + 1] = { line = line, modTags = crafted.mod.modTags or {}, range = crafted.range,
+				crafted = true, prefix = crafted.mod.type == "Prefix" or nil, suffix = crafted.mod.type == "Suffix" or nil }
+		end
+		item:BuildAndParseRaw()
+	end
+	local text = item:BuildRaw()
+	if not new("Item"):Item(text).base then error("the built item doesn't parse", 0) end
+	local influences = {}
+	for _, name in ipairs(ctx.spec.influences or {}) do influences[#influences + 1] = tostring(name):lower() end
+	-- The trade site knows "Two-Toned Boots", not PoB's "Two-Toned Boots (Armour/Energy Shield)"
+	local query = { base = (item.baseName:gsub(" %(.-%)$", "")), influences = #influences > 0 and influences or nil, mods = {} }
+	local mods, modLines = {}, {}
+	for _, pick in ipairs(picks) do
+		local lines = {}
+		for i, line in ipairs(pick.mod) do
+			lines[i] = itemLib.applyRange(line, pick.range)
+			modLines[#modLines + 1] = lines[i]
+		end
+		mods[#mods + 1] = { affix = (pick.crafted and "crafted " or "") .. pick.mod.type:lower(), text = table.concat(lines, " / "),
+			tier = not pick.crafted and ("T" .. pick.tier .. " of " .. pick.tiers) or nil, group = pick.mod.group }
+		for _, m in ipairs(tradeMods(pick)) do query.mods[#query.mods + 1] = m end
+	end
+	return { item = text, base = item.baseName, ilvl = ctx.ilvl, influences = query.influences, mods = mods, modLines = modLines, tradeQuery = query }
+end
+
+local function slotCheck(b, slotName, ctx)
+	local slot = b.itemsTab.slots[slotName]
+	if not slot then return "unknown slot " .. tostring(slotName) end
+	if not b.itemsTab:IsItemValidForSlot(ctx.item, slot.slotName) then return ctx.item.baseName .. " can't go in " .. slot.slotName end
+end
+
+function methods.design_rare(p)
+	if type(p.base) ~= "string" then return { error = "base required" } end
+	local b = env().build
+	local ctx, err = newContext(p)
+	if not ctx then return { error = err } end
+	if p.slot then
+		if not b then return { error = "no build loaded" } end
+		local bad = slotCheck(b, p.slot, ctx)
+		if bad then return { error = bad } end
+	end
+	local picks, rejected, used, count = {}, {}, {}, { Prefix = 0, Suffix = 0 }
+	local craftedReqs = {}
+	local function reject(req, reason) rejected[#rejected + 1] = { mod = req.text, reason = reason } end
+	for _, entry in ipairs(p.mods or {}) do
+		local req = type(entry) == "table" and entry or { text = entry }
+		if req.crafted then
+			craftedReqs[#craftedReqs + 1] = req
+		else
+			local pick, why = resolveRequest(ctx, req)
+			if not pick then
+				reject(req, why)
+			elseif used[pick.mod.group] then
+				reject(req, "same mod group as '" .. used[pick.mod.group] .. "' (one mod per group)")
+			elseif count[pick.mod.type] >= ctx.limit[pick.mod.type] then
+				reject(req, ordinal(count[pick.mod.type] + 1) .. " " .. pick.mod.type:lower() .. " (the item has " .. ctx.limit[pick.mod.type] .. ")")
+			else
+				used[pick.mod.group] = req.text
+				count[pick.mod.type] = count[pick.mod.type] + 1
+				picks[#picks + 1] = pick
+			end
+		end
+	end
+	for i, req in ipairs(craftedReqs) do
+		local pick, why = resolveRequest(ctx, req)
+		if i > 1 then
+			reject(req, "only one crafted modifier per item")
+		elseif not pick then
+			reject(req, why)
+		elseif used[pick.mod.group] then
+			reject(req, "same mod group as '" .. used[pick.mod.group] .. "' (one mod per group)")
+		elseif count[pick.mod.type] >= ctx.limit[pick.mod.type] then
+			reject(req, "no open " .. pick.mod.type:lower() .. " for a crafted mod")
+		else
+			count[pick.mod.type] = count[pick.mod.type] + 1
+			picks[#picks + 1] = pick
+		end
+	end
+	if #rejected > 0 then return { rejected = rejected, note = "nothing was built; fix or drop the rejected mods" } end
+	local ok, design = pcall(buildDesign, ctx, picks)
+	if not ok then return { error = tostring(design) } end
+	design.open = { prefixes = ctx.limit.Prefix - count.Prefix, suffixes = ctx.limit.Suffix - count.Suffix }
+	if p.slot then design.change = { equip = { slot = p.slot, item = design.item } } end
+	return design
+end
+
+local function equipChanges(items)
+	local changes = {}
+	for i, it in ipairs(items) do changes[i] = { equip = { slot = it.slot, item = it.item } } end
+	return changes
+end
+
+function methods.fill_resists(p)
+	local b = env().build
+	if not b then return { error = "no build loaded" } end
+	if type(p.slots) ~= "table" or #p.slots == 0 then return { error = "slots required" } end
+	if #p.slots > MAX_FILL_SLOTS then return { error = "at most " .. MAX_FILL_SLOTS .. " slots" } end
+	local spend = p.spend or { "+# to maximum Life", "+# to Strength" }
+	local states, bare = {}, {}
+	for i, slotName in ipairs(p.slots) do
+		local slot = b.itemsTab.slots[slotName]
+		if not slot then return { error = "unknown slot " .. tostring(slotName) } end
+		local current = b.itemsTab.items[slot.selItemId]
+		local baseName = (p.bases or {})[slotName] or current and current.baseName
+		if not baseName then return { error = slotName .. " is empty: give its base in `bases`" } end
+		local ctx, err = newContext({ base = baseName, ilvl = p.ilvl })
+		if not ctx then return { error = slotName .. ": " .. err } end
+		local bad = slotCheck(b, slotName, ctx)
+		if bad then return { error = bad } end
+		-- Suffixes the spend stats will need, kept free while resists are placed
+		local reserve = 0
+		for _, text in ipairs(spend) do
+			local tiers = findTiers(ctx, requestTemplate(text))
+			if tiers and tiers[1].mod.type == "Suffix" then reserve = reserve + 1 end
+		end
+		states[i] = { slot = slotName, ctx = ctx, picks = {}, used = {}, count = { Prefix = 0, Suffix = 0 }, reserve = reserve }
+		bare[i] = { slot = slotName, item = buildDesign(ctx, {}).item }
+	end
+	local want = p.stats or VARIANT_STATS
+	local before = variantRow(b, { name = "current" }, want)
+	local open = variantRow(b, { name = "bare bases", changes = equipChanges(bare) }, want)
+	if before.error or open.error then return { error = before.error or open.error } end
+
+	local function add(state, tiers, tier)
+		local pick = { id = tiers[tier].id, mod = tiers[tier].mod, tier = tier, tiers = #tiers, range = PROPOSAL_ROLL }
+		state.picks[#state.picks + 1] = pick
+		state.used[pick.mod.group] = true
+		state.count[pick.mod.type] = state.count[pick.mod.type] + 1
+	end
+	local gaps, warnings, notes = {}, {}, {}
+	for elem in pairs(RESIST_TEXT) do gaps[elem] = open.raw["Missing" .. elem .. "Resist"] or 0 end
+	-- The first pass leaves each item's Strength/life suffix free; the second uses it if the caps still aren't reached.
+	for _, sparing in ipairs({ true, false }) do
+		for _, elem in ipairs({ "Fire", "Cold", "Lightning" }) do
+			while gaps[elem] > 0 do
+				local best
+				for _, state in ipairs(states) do
+					local room = state.ctx.limit.Suffix - state.count.Suffix - (sparing and state.reserve or 0)
+					local tiers = room > 0 and findTiers(state.ctx, requestTemplate(RESIST_TEXT[elem])) or nil
+					if tiers and not state.used[tiers[1].mod.group] and (not best or room > best.room) then best = { state = state, room = room, tiers = tiers } end
+				end
+				if not best then break end
+				local list = allowedTiers(best.tiers)
+				local pick = math.min(PROPOSAL_TIER, #list)
+				-- The lowest tier that still covers the gap, but never better than the proposal tier
+				for i = pick, #list do
+					if rolledValue(list[i].mod, PROPOSAL_ROLL) >= gaps[elem] then pick = i end
+				end
+				gaps[elem] = gaps[elem] - rolledValue(list[pick].mod, PROPOSAL_ROLL)
+				add(best.state, best.tiers, list[pick].tier)
+			end
+		end
+	end
+	for elem, gap in pairs(gaps) do
+		if gap > 0 then warnings[#warnings + 1] = string.format("%s resistance is still %d short: every chosen slot is out of open suffixes", elem, gap) end
+	end
+	for _, state in ipairs(states) do
+		for _, text in ipairs(spend) do
+			local tiers = findTiers(state.ctx, requestTemplate(text))
+			local list = tiers and allowedTiers(tiers) or {}
+			local first = list[1]
+			if not first then
+				notes[#notes + 1] = state.slot .. ": " .. text .. " can't roll here"
+			elseif state.used[first.mod.group] or state.count[first.mod.type] >= state.ctx.limit[first.mod.type] then
+				notes[#notes + 1] = state.slot .. ": no open " .. first.mod.type:lower() .. " for " .. text
+			else
+				add(state, tiers, list[math.min(PROPOSAL_TIER, #list)].tier)
+			end
+		end
+	end
+	local items = {}
+	for i, state in ipairs(states) do
+		local design = buildDesign(state.ctx, state.picks)
+		design.slot = state.slot
+		design.change = { equip = { slot = state.slot, item = design.item } }
+		design.open = { prefixes = state.ctx.limit.Prefix - state.count.Prefix, suffixes = state.ctx.limit.Suffix - state.count.Suffix }
+		items[i] = design
+	end
+	local variant = { name = "fill_resists", changes = equipChanges(items) }
+	local after = variantRow(b, variant, want)
+	if after.error then return { error = after.error } end
+	local resists = {}
+	for elem in pairs(RESIST_TEXT) do
+		local missing = after.raw["Missing" .. elem .. "Resist"] or 0
+		resists[elem] = { total = after.raw[elem .. "ResistTotal"], cap = after.raw[elem .. "ResistTotal"] - after.raw[elem .. "ResistOverCap"], capped = missing == 0 }
+		if missing > 0 then warnings[#warnings + 1] = string.format("%s resistance ends %d below its cap", elem, missing) end
+	end
+	for _, w in ipairs(after.warnings or {}) do warnings[#warnings + 1] = w end
+	local delta = {}
+	for _, k in ipairs(want) do
+		if type(before.raw[k]) == "number" and type(after.raw[k]) == "number" then delta[k] = jsonNumber(after.raw[k] - before.raw[k]) end
+	end
+	pcall(recalc, b)
+	b:RefreshStatList()
+	return { items = items, variant = variant, resists = resists, before = before.stats, after = after.stats, delta = delta,
+		feasible = after.feasible, warnings = warnings, unsourcedConfig = after.unsourcedConfig, notes = #notes > 0 and notes or nil }
+end
+
 -- Chat: the in-app Agent tab queues user messages here; an external agent long-polls chat_wait and answers
 -- with chat_reply. State lives on `launch` so it survives `reload` (which swaps this module's upvalues).
 local function chat()
