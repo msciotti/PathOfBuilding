@@ -538,7 +538,7 @@ end
 -- `skillTypes` and `skillsFromOption` (the option's own ifSkill list) match active skills.
 local CONFIG_SOURCES = {
 	buffFortification = { text = { "fortify%f[%A]", "gain %d+ fortification", "you have your maximum fortification" },
-		notText = { "while you have fortify", "while fortified" }, gems = { "Fortify", "Vigilant Strike" } },
+		notText = { "while you have fortify", "while fortified", "kill" }, gems = { "Fortify", "Vigilant Strike" } },
 	useEnduranceCharges = chargeSource("endurance"),
 	useFrenzyCharges = chargeSource("frenzy"),
 	usePowerCharges = chargeSource("power"),
