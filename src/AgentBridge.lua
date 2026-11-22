@@ -421,6 +421,24 @@ local function configOptions()
 	return configOptionList
 end
 
+-- Config checkboxes whose skill flag the last calc raised (e.g. a mod granting Exposure on Hit unlocks "Is the enemy
+-- Exposed to Fire?") and that aren't ticked on the build
+local function unlockedConfigs(b, flagsBefore)
+	local flagsAfter = (mainSkill(b) or {}).skillFlags or {}
+	local input = b.configTab.configSets[b.configTab.activeConfigSetId].input
+	local unlocked = {}
+	for _, opt in ipairs(configOptions()) do
+		local gates = type(opt.ifFlag) == "table" and opt.ifFlag or { opt.ifFlag }
+		for _, f in ipairs(opt.ifFlag and gates or {}) do
+			if opt.type == "check" and flagsAfter[f] and not flagsBefore[f] and not input[opt.var] then
+				unlocked[#unlocked + 1] = { config = opt.var, label = StripEscapes(opt.label or opt.var) }
+				break
+			end
+		end
+	end
+	return unlocked
+end
+
 local function mainSocketSlot(b)
 	local s = mainSkill(b)
 	local slot = s and s.socketGroup and s.socketGroup.slot
@@ -516,18 +534,9 @@ function methods.what_if(p)
 	local ok, after, totalsAfter = evalMods(b, lines, socketedMods, names)
 	for _, m in ipairs(socketedMods) do table.insert(assume, 1, m) end
 	if ok then
-		local flagsAfter = (mainSkill(b) or {}).skillFlags or {}
-		local input = b.configTab.configSets[b.configTab.activeConfigSetId].input
-		for _, opt in ipairs(configOptions()) do
-			local gates = type(opt.ifFlag) == "table" and opt.ifFlag or { opt.ifFlag }
-			for _, f in ipairs(opt.ifFlag and gates or {}) do
-				if opt.type == "check" and flagsAfter[f] and not flagsBefore[f] and not input[opt.var] then
-					local label = StripEscapes(opt.label or opt.var)
-					reqs[#reqs + 1] = { kind = "config", desc = "Config: " .. label, metOnBuild = false }
-					assume[#assume + 1] = { config = opt.var, label = label }
-					break
-				end
-			end
+		for _, m in ipairs(unlockedConfigs(b, flagsBefore)) do
+			reqs[#reqs + 1] = { kind = "config", desc = "Config: " .. m.label, metOnBuild = false }
+			assume[#assume + 1] = m
 		end
 	end
 	local met
@@ -581,6 +590,11 @@ function methods.what_if(p)
 			if v ~= o then totals = totals or {} totals[k] = { before = o, after = v } end
 		end
 	end
+	local alreadyExposed
+	for name in pairs(names) do
+		local element = name:match("^(%a+)ExposureChance$")
+		if element and flagsBefore["apply" .. element .. "Exposure"] then alreadyExposed = element end
+	end
 	local note
 	if #alreadyKeystone > 0 then
 		note = "Keystone already allocated on this build: " .. table.concat(alreadyKeystone, ", ")
@@ -590,6 +604,8 @@ function methods.what_if(p)
 		note = "Attack-only mod(s) and the main skill is a spell: " .. table.concat(flagMismatch, "; ")
 	elseif #capped > 0 and next(diff) == nil then
 		note = "Capped: " .. table.concat(capped, "; ")
+	elseif alreadyExposed and next(diff) == nil and not (met and next(met.changed)) then
+		note = "The build already applies " .. alreadyExposed .. " Exposure on hit, so this adds nothing new."
 	elseif changedOther then
 		note = "None of the requested stats changed, but other stats did: see changedOther."
 	elseif next(diff) == nil and #unsupported == 0 then
@@ -709,6 +725,7 @@ function methods.rank_options(p)
 	for _, k in ipairs(p.stats or {}) do show[#show + 1] = k end
 
 	local base = snapshot(b.calcsTab.mainOutput)
+	local flagsBefore = copyTable((mainSkill(b) or {}).skillFlags or {}, true)
 	local bestLvl = {}
 	for _, e in ipairs(res) do
 		if e.group then
@@ -799,15 +816,17 @@ function methods.rank_options(p)
 				local assumed
 				if (changed == 0 or score == 0) and p.assume ~= false then
 					local assume, names, seenName = {}, {}, {}
-					for _, l in ipairs(mods) do
-						for _, m in ipairs(parseLine(l)._assume) do
-							local name = assumedNames({ m })[1]
-							if not seenName[name] then
-								seenName[name] = true
-								assume[#assume + 1] = m
-								names[#names + 1] = name
-							end
+					local function addAssume(m)
+						local name = assumedNames({ m })[1]
+						if not seenName[name] then
+							seenName[name] = true
+							assume[#assume + 1] = m
+							names[#names + 1] = name
 						end
+					end
+					for _, m in ipairs(unlockedConfigs(b, flagsBefore)) do addAssume(m) end
+					for _, l in ipairs(mods) do
+						for _, m in ipairs(parseLine(l)._assume) do addAssume(m) end
 					end
 					if #assume > 0 then
 						local ok2, afterMet = evalMods(b, mods, assume)
