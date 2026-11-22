@@ -12,6 +12,7 @@ local TEXT_HEIGHT = 16
 local PAD = 6
 local HEADER = 28
 local FOOTER = 34
+local PANEL_LAYER = 50 -- above tree art (sublayers up to 30), below tooltips (100)
 local REVEAL_CPS = 400 -- reply "typing" speed in chars per second, capped so long replies finish within REVEAL_MAX ms
 local REVEAL_MAX = 3000
 
@@ -248,8 +249,7 @@ function AgentTabClass:Draw(viewPort)
 	local scrollBar = self.controls.scrollBar
 	local boxX, boxY, boxW, boxH = self:TranscriptBox()
 
-	-- Above tree art (sublayers up to 30), below tooltips (99+)
-	SetDrawLayer(nil, 50)
+	SetDrawLayer(nil, PANEL_LAYER)
 
 	-- Panel background with a divider against the tab
 	SetDrawColor(0.1, 0.1, 0.1)
@@ -289,6 +289,13 @@ function AgentTabClass:Draw(viewPort)
 		SetViewport()
 	end
 
-	self:DrawControls(viewPort)
+	-- Like DrawControls, but back on the panel's layer before each control: Edit/Button controls reset the
+	-- sublayer to 0 after drawing a hover tooltip, which would put later controls under the panel background
+	for _, control in pairs(self.controls) do
+		if control:IsShown() and control.Draw then
+			SetDrawLayer(nil, PANEL_LAYER)
+			control:Draw(viewPort, self.selControl and self.selControl.hasFocus and self.selControl ~= control)
+		end
+	end
 	SetDrawLayer(nil, 0)
 end
