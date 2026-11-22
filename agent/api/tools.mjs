@@ -1,4 +1,5 @@
 import net from "node:net";
+import { priceLookup, tradeSearch } from "./market.mjs";
 
 export const PORT = Number(process.env.POB_AGENT_PORT || 49090);
 
@@ -45,4 +46,10 @@ export const TOOLS = [
   { name: "pob_list_stats", method: "list_stats",
     description: "List PoB's calculated output stat names for the open build with current values (and the sidebar label where one exists). Filter with `query` (e.g. 'avoid', 'maxhit', 'resist', 'dps'). Use these names as goals/stats in other tools.",
     inputSchema: { type: "object", properties: { query: str } } },
+  { name: "price_lookup", run: priceLookup,
+    description: "Price items from poe.ninja: uniques (by variant/links), skill gems (level, quality, corrupted) and currency, in chaos and divines with the listing count. Names poe.ninja doesn't list (e.g. Awakener's Orb) fall back to the trade site's currency exchange, quoted as cheapest and median of the cheapest ~10 offers. Each name is a string or an object with filters. Defaults to the current challenge league. Not tied to the open build.",
+    inputSchema: { type: "object", properties: { names: { type: "array", items: { oneOf: [str, { type: "object", properties: { name: str, links: int, variant: str, level: int, quality: int, corrupted: { type: "boolean" } }, required: ["name"] }] } }, league: str }, required: ["names"] } },
+  { name: "trade_search", run: tradeSearch,
+    description: "Search the official PoE trade site (read-only, instant-buyout listings only, so every price can be bought right away) by base type or category with mods given as text; mod text is mapped to trade stat ids automatically and the mapping is returned in `mapped` - check it. Numbers inside the text are ignored: set min/max for the value (for 'Adds # to # ...' mods the value is the average of the two numbers). For totals use pseudo wording such as 'total fire resistance', 'total maximum life', 'total strength'. Returns the total match count, the cheapest listing and the median of the cheapest ~10 (chaos and divines, so one underpriced or fake listing is visible), and the cheapest listings with all their mods and rolls. Influences, when given, are exact: unlisted influences are excluded. Results are cached for a few minutes and requests follow the trade API's rate limits, so a call can take several seconds.",
+    inputSchema: { type: "object", properties: { base: str, category: str, mods: { type: "array", items: { type: "object", properties: { text: str, min: { type: "number" }, max: { type: "number" }, type: { type: "string", enum: ["explicit", "implicit", "fractured", "crafted", "enchant", "pseudo"] } }, required: ["text"] } }, influences: { type: "array", items: { type: "string", enum: ["shaper", "elder", "crusader", "redeemer", "hunter", "warlord"] } }, corrupted: { type: "boolean" }, league: str, limit: int } } },
 ];
