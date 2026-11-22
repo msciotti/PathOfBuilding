@@ -34,18 +34,64 @@ local function eligibleSlots(m)
 	return slots
 end
 
+-- How an explicit/corrupted mod with no spawn weight anywhere can still be obtained. Tags it names (e.g.
+-- "staff_elder") with weight 0 mean it no longer rolls there: legacy, unless Elevated (Maven's Orb) or an essence's.
+local function zeroWeightOrigin(m, isEssence)
+	if not m.weightKey or #m.weightKey == 0 then return nil end
+	local tags = {}
+	for i, k in ipairs(m.weightKey) do
+		if (m.weightVal[i] or 0) > 0 then return nil end
+		if k ~= "default" then tags[#tags + 1] = k end
+	end
+	if isEssence then
+		return "essence only (see the essence entry for item classes)"
+	elseif (m.affix or ""):find("Elevated") then
+		return "Maven's Orb upgrade of the influenced mod", tags
+	elseif #tags > 0 then
+		return "legacy: no longer rolls", nil, true
+	end
+	return "does not roll randomly (special source such as an essence, Incursion or Bestiary)"
+end
+
 function M.build(data, tree)
 	local idx = { list = {}, sources = {}, order = {} }
+
+	-- Vestigial mods come from one unique and can roll on any unique of the same item type (PoB's
+	-- AddImplicitPopup rule), so record the source unique and that type
+	local uniqueType = {}
+	for typeName, list in pairs(data.uniques or {}) do
+		for _, raw in ipairs(list) do
+			local name = raw:match("^%s*([^\r\n]+)")
+			if name then uniqueType[name] = typeName end
+		end
+	end
+
+	local essenceMod = {}
+	for _, e in pairs(data.essences or {}) do
+		for _, modId in pairs(type(e) == "table" and e.mods or {}) do essenceMod[modId] = true end
+	end
 
 	for srcName, mods in pairs(data.itemMods) do
 		if srcName ~= "Item" then
 			for id, m in pairs(mods) do
 				if type(m) == "table" then
-					addEntry(idx, {
+					local e = {
 						src = "mod:" .. srcName, id = id, name = m.affix ~= "" and m.affix or nil,
 						kind = m.type, level = m.level, lines = modLines(m),
 						tags = m.modTags, spawnOn = eligibleSlots(m), group = m.group,
-					})
+					}
+					if srcName == "Explicit" or srcName == "Corrupted" then
+						local obtain, tags, legacy = zeroWeightOrigin(m, essenceMod[id])
+						e.obtain, e.legacy = obtain, legacy
+						if tags then e.spawnOn = tags end
+					end
+					local from = srcName == "Vestigial" and data.vestigialModMappings and data.vestigialModMappings[id]
+					if from then
+						e.name = "Vestigial implicit from " .. from
+						e.kind = "Vestigial"
+						e.spawnOn = uniqueType[from] and { "any unique " .. uniqueType[from] } or nil
+					end
+					addEntry(idx, e)
 				end
 			end
 		end
@@ -59,6 +105,7 @@ function M.build(data, tree)
 					src = "passive:ascendancy:" .. n.ascendancyName, id = tostring(id), name = n.dn,
 					kind = n.type, lines = n.sd, ascendancy = n.ascendancyName,
 				})
+			elseif not n.group and (n.type == "Notable" or n.type == "Keystone") then
 			elseif n.sd and #n.sd > 0 and n.type ~= "ClassStart" then
 				addEntry(idx, {
 					src = "passive:" .. (n.type or "Normal"):lower(), id = tostring(id), name = n.dn,
@@ -83,6 +130,36 @@ function M.build(data, tree)
 			if n.sd and #n.sd > 0 then
 				addEntry(idx, { src = "timeless", id = tostring(n.id), name = n.dn, kind = n.ks and "Keystone" or n["not"] and "Notable" or nil, lines = n.sd })
 			end
+		end
+	end
+
+	-- Notable mods are weighted by enchant tag, which several enchants can share (both block enchants are
+	-- "affliction_chance_to_block"), so map tags rather than PoB's per-skill clusterJewelInfoForNotable.
+	local enchantsByTag = {}
+	for size, jewel in pairs(data.clusterJewels and data.clusterJewels.jewels or {}) do
+		for key, skill in pairs(jewel.skills or {}) do
+			local tag = skill.tag or key
+			enchantsByTag[tag] = enchantsByTag[tag] or {}
+			table.insert(enchantsByTag[tag], size .. ": " .. skill.name)
+			addEntry(idx, { src = "cluster:enchant", id = key, name = size .. " - " .. skill.name, kind = "Enchant",
+				lines = skill.stats or {}, spawnOn = { size } })
+		end
+	end
+	for _, m in pairs(data.itemMods.JewelCluster or {}) do
+		local name = type(m) == "table" and type(m[1]) == "string" and m[1]:match("^1 Added Passive Skill is (.+)$")
+		local node = name and tree and tree.clusterNodeMap and tree.clusterNodeMap[name]
+		if node and node.sd and #node.sd > 0 then
+			local on, seen = {}, {}
+			for i, tag in ipairs(m.weightKey or {}) do
+				if (m.weightVal[i] or 0) > 0 then
+					for _, enchant in ipairs(enchantsByTag[tag] or {}) do
+						if not seen[enchant] then seen[enchant] = true on[#on + 1] = enchant end
+					end
+				end
+			end
+			table.sort(on)
+			addEntry(idx, { src = "cluster:" .. (node.isKeystone and "keystone" or "notable"), id = name, name = name,
+				kind = node.isKeystone and "Keystone" or "Notable", lines = node.sd, spawnOn = on })
 		end
 	end
 
@@ -294,8 +371,8 @@ function M.search(idx, query, opts)
 	local wantsMinion = phrase:find("minion", 1, true) ~= nil
 	local wantsPresence = phrase:find("presence", 1, true) ~= nil
 	for _, e in ipairs(idx.list) do
-		local ok = true
-		if opts.sources then
+		local ok = opts.includeLegacy or not e.legacy
+		if ok and opts.sources then
 			ok = false
 			for _, p in ipairs(opts.sources) do
 				if e.src:sub(1, #p) == p then ok = true break end

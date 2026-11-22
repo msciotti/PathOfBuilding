@@ -113,15 +113,21 @@ end
 
 local function entryOut(e)
 	return { src = e.src, id = e.id, name = e.name, kind = e.kind, level = e.level, group = e.group,
-		lines = e.lines, tags = e.tags, spawnOn = e.spawnOn, ascendancy = e.ascendancy, essenceSlots = e.essenceSlots }
+		lines = e.lines, tags = e.tags, spawnOn = e.spawnOn, ascendancy = e.ascendancy, essenceSlots = e.essenceSlots,
+		obtain = e.obtain, legacy = e.legacy }
 end
+
+local passiveStatus
 
 function methods.search(p)
 	local res, total, by, terms = AgentData.search(getIndex(), p.query or "", {
-		sources = p.sources, slot = p.slot, limit = p.limit or 50, exact = p.exact })
+		sources = p.sources, slot = p.slot, limit = p.limit or 50, exact = p.exact, includeLegacy = p.includeLegacy })
+	local b = env().build
 	local out = {}
 	for i, e in ipairs(res) do
 		out[i] = entryOut(e)
+		local status = b and (e.src:find("^passive:") or e.src:find("^cluster:")) and passiveStatus(b, e)
+		if status then out[i].allocated, out[i].pathDist = status.allocated, status.pathDist end
 		if #e.lines > 3 then out[i].matched = AgentData.matchedLines(e, terms) end
 	end
 	local note
@@ -134,6 +140,29 @@ function methods.inspect(p)
 	local v, err = resolve(p.path or "")
 	if err then return { error = err, roots = { "build", "data", "main", "tree" } } end
 	return { path = p.path, value = project(v, p.depth or 2, {}, p.maxKeys or 80) }
+end
+
+-- Derived 0/1 stats: an ailment is effectively immune when it can't be applied (avoid chance 100) or it does
+-- nothing to you (Self<X>Effect or Self<X>Duration 0, e.g. "Unaffected by Poison"). Lets agents rank
+local IMMUNE_AILMENTS = { "Poison", "Bleed", "Ignite", "Chill", "Freeze", "Shock", "Scorch", "Brittle", "Sap" }
+local function addDerived(out, t)
+	for _, a in ipairs(IMMUNE_AILMENTS) do
+		local avoid, effect, duration = out[a .. "AvoidChance"], out["Self" .. a .. "Effect"], out["Self" .. a .. "Duration"]
+		if avoid or effect then
+			local immune = (tonumber(avoid) or 0) >= 100 or tonumber(effect) == 0 or tonumber(duration) == 0
+			t[a .. "ImmuneEffective"] = immune and 1 or 0
+		end
+	end
+	return t
+end
+
+local function snapshot(out)
+	local t = {}
+	for k, v in pairs(out) do
+		if type(v) == "number" then t[k] = v
+		elseif type(v) == "boolean" then t[k] = v and 1 or 0 end
+	end
+	return addDerived(out, t)
 end
 
 local function mainSkillInfo(b)
@@ -160,7 +189,7 @@ function methods.get_state()
 		class = b.spec and b.spec.curClassName, ascendancy = b.spec and b.spec.curAscendClassName,
 		level = b.characterLevel, mainSkill = mainSkillInfo(b),
 		dpsHint = "Use CombinedDPS (or TotalDPS for hits only) as a DPS goal. FullDPS is only set when skills are marked for Full DPS; PoisonDPS/BleedDPS are per stack, so use WithPoisonDPS/WithBleedDPS or CombinedDPS.",
-		stats = project(b.calcsTab and b.calcsTab.mainOutput or {}, 1, {}, 2000),
+		stats = snapshot(b.calcsTab and b.calcsTab.mainOutput or {}),
 	}
 end
 
@@ -173,24 +202,15 @@ function methods.list_stats(p)
 	end
 	local q = p.query and p.query:lower()
 	local out = {}
-	for k, v in pairs(b.calcsTab.mainOutput) do
-		local t = type(v)
-		if (t == "number" or t == "boolean") and (not q or k:lower():find(q, 1, true) or (labels[k] or ""):lower():find(q, 1, true)) then
-			out[#out + 1] = { stat = k, label = labels[k], value = t == "boolean" and (v and 1 or 0) or v }
+	for k, v in pairs(snapshot(b.calcsTab.mainOutput)) do
+		if not q or k:lower():find(q, 1, true) or (labels[k] or ""):lower():find(q, 1, true) then
+			out[#out + 1] = { stat = k, label = labels[k], value = v }
 		end
 	end
 	table.sort(out, function(a, b) return a.stat < b.stat end)
-	return { count = #out, stats = out, note = "Boolean outputs are shown as 0/1. Values are for the build as configured." }
+	return { count = #out, stats = out, note = "Boolean outputs are shown as 0/1. <Ailment>ImmuneEffective (agent-derived) is 1 when the ailment can't be applied (AvoidChance 100) or does nothing to you (Self<Ailment>Effect/Duration 0, e.g. Unaffected by Poison). Values are for the build as configured." }
 end
 
-local function snapshot(out)
-	local t = {}
-	for k, v in pairs(out) do
-		if type(v) == "number" then t[k] = v
-		elseif type(v) == "boolean" then t[k] = v and 1 or 0 end
-	end
-	return t
-end
 
 -- Item text writes rolls as "(12-14)"; PoB resolves them before parsing, so do the same.
 local function resolveRanges(line, roll)
@@ -405,6 +425,14 @@ local function attackOnly(flags)
 	return false
 end
 
+local function assumedBaseline(b, assume)
+	local only = {}
+	for _, m in ipairs(assume) do
+		if not m.raw then only[#only + 1] = m end
+	end
+	return evalMods(b, {}, only)
+end
+
 local function assumedNames(assume)
 	local names = {}
 	for _, m in ipairs(assume) do
@@ -495,8 +523,17 @@ function methods.what_if(p)
 	for _, q in ipairs(reqs) do if q.metOnBuild ~= true then needsAssume = true end end
 	if ok and #assume > 0 and p.assume ~= false and needsAssume then
 		local ok3, afterMet = evalMods(b, lines, assume)
-		if ok3 then
-			met = { assumed = assumedNames(assume), cannotForce = #unmet > 0 and unmet or nil, changed = diffStats(base, afterMet, want) }
+		-- Measure against the build with the same assumptions but without these mods, so forcing a condition
+		-- (e.g. activating the equipped flasks) isn't credited to the mod being tested
+		local okB, baseMet = assumedBaseline(b, assume)
+		if ok3 and okB then
+			met = { assumed = assumedNames(assume), cannotForce = #unmet > 0 and unmet or nil, changed = diffStats(baseMet, afterMet, want),
+				note = "before = the build with the assumptions applied but without these mods" }
+			local fromAssume = diffStats(base, baseMet, want)
+			if next(met.changed) == nil and next(fromAssume) ~= nil then
+				met.alreadyFromAssumptions = fromAssume
+				met.note = met.note .. "; the assumptions by themselves already change alreadyFromAssumptions (e.g. an equipped flask that has this effect)"
+			end
 		end
 	end
 	local ok2 = pcall(recalc, b)
@@ -558,11 +595,100 @@ function methods.what_if(p)
 		ifConditionsMet = met, modTotals = totals, socketedAppliedTo = #socketedInfo > 0 and socketedInfo or nil, changedOther = changedOther, capped = #capped > 0 and capped or nil, unsupported = #unsupported > 0 and unsupported or nil, restored = ok2, note = note }
 end
 
+function passiveStatus(b, e)
+	local spec = b.spec
+	if e.src == "passive:mastery" then
+		local effect = tonumber(e.id)
+		for _, sel in pairs(spec.masterySelections or {}) do
+			if sel == effect then return { allocated = true } end
+		end
+		local best
+		for _, node in pairs(spec.nodes) do
+			if not node.alloc and node.type == "Mastery" and node.pathDist and node.pathDist < 1000 then
+				for _, fx in ipairs(node.masteryEffects or {}) do
+					if fx.effect == effect and (not best or node.pathDist < best) then best = node.pathDist end
+				end
+			end
+		end
+		return { allocated = false, pathDist = best }
+	elseif e.src:find("^passive:") then
+		local node = spec.nodes[tonumber(e.id)]
+		if not node then return nil end
+		return { allocated = node.alloc and true or false, pathDist = not node.alloc and node.pathDist < 1000 and node.pathDist or nil }
+	elseif e.src == "cluster:notable" or e.src == "cluster:keystone" then
+		for _, node in pairs(spec.allocNodes) do
+			if node.dn == e.name then return { allocated = true } end
+		end
+		return { allocated = false }
+	end
+end
+
+function methods.path_cost(p)
+	local b = env().build
+	if not b then return { error = "no build loaded" } end
+	local spec = b.spec
+	local targets, unknown = {}, {}
+	for _, want in ipairs(p.nodes or {}) do
+		local group = {}
+		local id = tonumber(want)
+		if id and spec.nodes[id] then
+			group[1] = spec.nodes[id]
+		else
+			for _, node in pairs(spec.nodes) do
+				if node.dn and node.dn:lower() == tostring(want):lower() then group[#group + 1] = node end
+			end
+		end
+		if #group == 0 then unknown[#unknown + 1] = want else targets[#targets + 1] = { want = want, nodes = group } end
+	end
+	local taken = {}
+	for id, node in pairs(spec.allocNodes) do taken[node] = true end
+	local total, steps = 0, {}
+	while #targets > 0 do
+		local dist, parent, queue, qs = {}, {}, {}, 1
+		for node in pairs(taken) do dist[node] = 0 queue[#queue + 1] = node end
+		while qs <= #queue do
+			local node = queue[qs]
+			qs = qs + 1
+			for _, other in ipairs(node.linked or {}) do
+				local w = taken[other] and 0 or 1
+				local d = dist[node] + w
+				local canTraverse = node.type ~= "Mastery" and other.type ~= "ClassStart" and other.type ~= "AscendClassStart"
+					and (node.ascendancyName == other.ascendancyName or (dist[node] == 0 and not other.ascendancyName))
+				if canTraverse and d < (dist[other] or math.huge) then
+					dist[other], parent[other] = d, node
+					if w == 0 then qs = qs - 1 queue[qs] = other else queue[#queue + 1] = other end
+				end
+			end
+		end
+		local bestT, bestNode, bestI
+		for i, t in ipairs(targets) do
+			for _, node in ipairs(t.nodes) do
+				if dist[node] and (not bestNode or dist[node] < dist[bestNode]) then bestT, bestNode, bestI = t, node, i end
+			end
+		end
+		if not bestNode then
+			for _, t in ipairs(targets) do unknown[#unknown + 1] = tostring(t.want) .. " (unreachable)" end
+			break
+		end
+		local path, node = {}, bestNode
+		while node and not taken[node] do
+			table.insert(path, 1, node.dn or tostring(node.id))
+			taken[node] = true
+			node = parent[node]
+		end
+		total = total + #path
+		steps[#steps + 1] = { target = bestT.want, id = bestNode.id, points = #path, path = path }
+		table.remove(targets, bestI)
+	end
+	return { points = total, steps = steps, notFound = #unknown > 0 and unknown or nil,
+		note = "Greedy over the targets: an exact optimum can occasionally be a point or two lower. Cluster jewel nodes only count if their jewel is socketed." }
+end
+
 function methods.rank_options(p)
 	local b = env().build
 	if not b then return { error = "no build loaded" } end
 	local res, total, _, terms = AgentData.search(getIndex(), p.query or "", {
-		sources = p.sources, slot = p.slot, limit = 100000, exact = p.exact })
+		sources = p.sources, slot = p.slot, limit = 100000, exact = p.exact, includeLegacy = p.includeLegacy })
 	local goal = {}
 	if type(p.goal) == "string" then goal[p.goal] = 1
 	elseif type(p.goal) == "table" then for k, w in pairs(p.goal) do goal[k] = w end end
@@ -578,28 +704,48 @@ function methods.rank_options(p)
 			if (bestLvl[k] or -1) < (e.level or 0) then bestLvl[k] = e.level or 0 end
 		end
 	end
-	local function measure(after)
+	local function measure(after, from)
+		from = from or base
 		local changed, score = 0, 0
 		for k, v in pairs(after) do
-			if math.abs(v - (base[k] or 0)) > 1e-9 then changed = changed + 1 end
+			if math.abs(v - (from[k] or 0)) > 1e-9 then changed = changed + 1 end
 		end
 		for k, w in pairs(goal) do
-			local o, v = base[k] or 0, after[k] or 0
+			local o, v = from[k] or 0, after[k] or 0
 			-- (after-before)/max(|before|,|after|): one bounded scale (-1..1) even when before is 0
 			local d = math.max(math.abs(o), math.abs(v))
 			if d > 0 and v == v and o == o and d ~= math.huge then score = score + w * (v - o) / d end
 		end
 		return changed, score
 	end
-	local seen, rows, skipped = {}, {}, 0
+	local baselines, fromAssumptionsAlone = {}, {}
+	local function baselineFor(names, assume)
+		local key = table.concat(names, "|")
+		if baselines[key] == nil then
+			local ok, snap = assumedBaseline(b, assume)
+			baselines[key] = ok and snap or false
+			if ok and next(goal) then
+				local _, s0 = measure(snap)
+				if s0 > 0 then
+					fromAssumptionsAlone[#fromAssumptionsAlone + 1] = { assumed = names, score = s0 }
+				end
+			end
+		end
+		return baselines[key] or nil
+	end
+	local seen, rows, skipped, allocatedSkipped = {}, {}, 0, {}
 	local t0, budget, cap = os.clock(), p.budget or 120, p.max or 500
 	local evaluated, timedOut = 0, false
 	for _, e in ipairs(res) do
 		if evaluated >= cap then break end
 		if os.clock() - t0 > budget then timedOut = true break end
 		local mods, partial = {}, nil
+		local status = (e.src:find("^passive:") or e.src:find("^cluster:")) and passiveStatus(b, e) or nil
 		if e.group and (e.level or 0) < (bestLvl[e.src .. "|" .. e.group] or 0) and (p.roll or "max") == "max" then
 			skipped = skipped + 1
+		elseif status and status.allocated and e.src:find("^passive:") then
+			-- Already on the tree: adding it again would double-count it
+			allocatedSkipped[#allocatedSkipped + 1] = e.name or e.id
 		else
 			-- Uniques carry every variant's lines; score only the lines that match the query
 			local lines = e.lines
@@ -609,13 +755,20 @@ function methods.rank_options(p)
 			for _, l in ipairs(lines) do mods[#mods + 1] = resolveRanges(l, p.roll or "max") end
 		end
 		local text = table.concat(mods, "\n")
-		if #mods == 0 or seen[text] then skipped = skipped + 1
+		if #mods == 0 then skipped = skipped + 1
+		elseif seen[text] then
+			-- Same mod text from another source (e.g. a unique's line that also exists as a vestigial or explicit
+			-- mod): score once, but list every source on that row
+			skipped = skipped + 1
+			local also = seen[text]
+			also[#also + 1] = { src = e.src, name = e.name or e.id, spawnOn = e.spawnOn }
 		else
-			seen[text] = true
+			seen[text] = {}
 			evaluated = evaluated + 1
 			local ok, after = evalMods(b, mods)
 			if ok then
 				local changed, score = measure(after)
+				local rowBase
 				local assumed
 				if (changed == 0 or score == 0) and p.assume ~= false then
 					local assume, names, seenName = {}, {}, {}
@@ -631,17 +784,18 @@ function methods.rank_options(p)
 					end
 					if #assume > 0 then
 						local ok2, afterMet = evalMods(b, mods, assume)
-						if ok2 then
-							local c2, s2 = measure(afterMet)
+						local from = baselineFor(names, assume)
+						if ok2 and from then
+							local c2, s2 = measure(afterMet, from)
 							if c2 > changed or s2 > score then
-								after, changed, score, assumed = afterMet, c2, s2, names
+								after, changed, score, assumed, rowBase = afterMet, c2, s2, names, from
 							end
 						end
 					end
 				end
 				local deltas = {}
 				for _, k in ipairs(show) do
-					deltas[k] = { before = base[k] or 0, after = after[k] or 0 }
+					deltas[k] = { before = (rowBase or base)[k] or 0, after = after[k] or 0 }
 				end
 				local unsupported, requires
 				for _, l in ipairs(mods) do
@@ -653,7 +807,9 @@ function methods.rank_options(p)
 					end
 				end
 				rows[#rows + 1] = { src = e.src, name = e.name or e.id, id = e.id, mods = mods, matchedLinesOnly = partial, unsupported = unsupported, requires = requires,
-					spawnOn = e.spawnOn, score = score, statsChanged = changed, stats = deltas, assumed = assumed }
+					spawnOn = e.spawnOn, score = score, statsChanged = changed, stats = deltas, assumed = assumed,
+					alsoFrom = seen[text], obtain = e.obtain, pathDist = status and status.pathDist,
+					alreadyOnBuild = status and status.allocated or nil }
 			end
 		end
 	end
@@ -672,14 +828,21 @@ function methods.rank_options(p)
 	end
 	return { candidates = total, evaluated = evaluated, duplicatesSkipped = skipped, timedOut = timedOut, noEffect = noEffect,
 		seconds = os.clock() - t0, roll = p.roll or "max", ranked = top,
-		note = "Rows with `assumed` only score that way once those conditions hold (flask active, aura on, threshold reached...)." }
+		alreadyOnBuildIf = #fromAssumptionsAlone > 0 and fromAssumptionsAlone or nil,
+		alreadyAllocated = #allocatedSkipped > 0 and allocatedSkipped or nil,
+		note = "Rows with `assumed` only score that way once those conditions hold (flask active, aura on, threshold reached...). "
+			.. "Passive rows carry pathDist (points from the current tree); use path_cost for several nodes together. "
+			.. "Passives already allocated are left out (alreadyAllocated); legacy mods that no longer roll are left out unless includeLegacy." }
 end
 
+-- Index key: the line at its max roll. Exact text, not the number-stripped shape, so "100% chance to Avoid being
+-- Frozen" and "(21-25)% chance to Avoid being Frozen" each get their own probed delta.
 local function normLine(l)
-	return (l:gsub("%(%-?[%d%.]+%-%-?[%d%.]+%)", "#"):gsub("%-?%d+%.?%d*", "#"))
+	return (resolveRanges(l, "max"):gsub("%s+", " "):match("^%s*(.-)%s*$"))
 end
 
 local CACHE = "agent_effects.json"
+local EFFECTS_VERSION = 3 -- bump when the key or probe logic changes; older caches are discarded
 local effects, queue, qpos  -- effects[normLine] = { text=probedText, d={stat=delta}, n=changedCount }
 
 local function loadEffects()
@@ -689,12 +852,13 @@ local function loadEffects()
 	if f then
 		local ok, t = pcall(json.decode, f:read("*a"))
 		f:close()
-		if ok and type(t) == "table" then effects = t end
+		if ok and type(t) == "table" and t._version == EFFECTS_VERSION then effects = t end
 	end
 end
 
 local function saveEffects()
 	local f = io.open(CACHE, "w")
+	effects._version = EFFECTS_VERSION
 	if f then f:write(json.encode(effects)) f:close() end
 end
 
@@ -702,12 +866,12 @@ local function buildQueue()
 	queue, qpos = {}, 1
 	local seen = {}
 	for _, e in ipairs(getIndex().list) do
-		if not e.src:find("^gem") and not e.src:find("^enchant") then
+		if not e.src:find("^gem") then
 			for _, l in ipairs(e.lines) do
 				local k = normLine(l)
 				if not seen[k] and not effects[k] and #l > 3 then
 					seen[k] = true
-					queue[#queue + 1] = { k = k, text = resolveRanges(l, "max") }
+					queue[#queue + 1] = { k = k, text = k }
 				end
 			end
 		end
@@ -718,13 +882,14 @@ function methods.probe_batch(p)
 	local b = env().build
 	if not b then return { error = "no build loaded" } end
 	loadEffects()
-	if p.reset then effects = {} queue = nil end
+	if p.reset then effects = { _version = EFFECTS_VERSION } queue = nil end
 	if not queue then buildQueue() end
 	local base = snapshot(b.calcsTab.mainOutput)
-	local function deltas(after)
+	local probeBaselines = {}
+	local function deltas(after, from)
 		local d, n = {}, 0
 		for k, v in pairs(after) do
-			local o = base[k] or 0
+			local o = (from or base)[k] or 0
 			if math.abs(v - o) > 1e-9 then d[k] = v - o n = n + 1 end
 		end
 		return d, n
@@ -742,7 +907,12 @@ function methods.probe_batch(p)
 			if ok then fx.d, fx.n = deltas(after) else fx.d, fx.n, fx.err = {}, 0, true end
 			if #parsed._assume > 0 then
 				local okm, afterMet = evalMods(b, { q.text }, parsed._assume)
-				if okm then fx.dm, fx.nm = deltas(afterMet) end
+				local key = table.concat(assumedNames(parsed._assume), "|")
+				if probeBaselines[key] == nil then
+					local okB, snap = assumedBaseline(b, parsed._assume)
+					probeBaselines[key] = okB and snap or false
+				end
+				if okm and probeBaselines[key] then fx.dm, fx.nm = deltas(afterMet, probeBaselines[key]) end
 				fx.req = {}
 				for _, r in ipairs(parsed.requires) do fx.req[#fx.req + 1] = r.desc end
 			end
@@ -763,8 +933,8 @@ function methods.find_by_effect(p)
 	local hits, total = {}, 0
 	local dir = p.direction or "up"
 	for _, e in ipairs(getIndex().list) do
-		local ok = true
-		if p.sources then
+		local ok = p.includeLegacy or not e.legacy
+		if ok and p.sources then
 			ok = false
 			for _, pre in ipairs(p.sources) do if e.src:sub(1, #pre) == pre then ok = true break end end
 		end
@@ -792,7 +962,7 @@ function methods.find_by_effect(p)
 				total = total + 1
 				hits[#hits + 1] = { src = e.src, name = e.name or e.id, delta = best, line = via, requires = req,
 					requirementsMetOnBuild = req and metNow or nil,
-					spawnOn = e.spawnOn, allLines = e.lines, level = e.level, group = e.group }
+					spawnOn = e.spawnOn, allLines = e.lines, level = e.level, group = e.group, obtain = e.obtain }
 			end
 		end
 	end
@@ -817,6 +987,7 @@ function methods.effect_stats(p)
 	local c, noeff, errs, unsupported, conditional = 0, 0, 0, 0, 0
 	local statCounts = {}
 	for k, v in pairs(effects) do
+		if type(v) ~= "table" then goto continue end
 		c = c + 1
 		if v.unsupported then unsupported = unsupported + 1
 		elseif v.n == 0 and (v.nm or 0) == 0 then noeff = noeff + 1 end
@@ -826,6 +997,7 @@ function methods.effect_stats(p)
 		for s in pairs(v.d or {}) do moved[s] = true end
 		for s in pairs(v.dm or {}) do moved[s] = true end
 		for s in pairs(moved) do statCounts[s] = (statCounts[s] or 0) + 1 end
+		::continue::
 	end
 	return { probed = c, unsupportedByParser = unsupported, conditional = conditional, noEffect = noeff, errors = errs,
 		statsMoved = statCounts }
@@ -869,7 +1041,7 @@ function methods.chat_wait(p)
 		c.lastSeen = GetTime()
 		c.delivered = #c.messages
 		if #msgs == 0 then return { messages = {}, timedOut = true, hint = "No message yet; call chat_wait again." } end
-		c.status = "Thinking..."
+		c.thinking = { steps = {}, since = GetTime() }
 		return { messages = msgs, build = buildName(), hint = "Answer with chat_reply (use chat_status for progress), then call chat_wait again." }
 	end }
 end
@@ -878,16 +1050,20 @@ function methods.chat_reply(p)
 	local c = chat()
 	if type(p.text) ~= "string" or p.text == "" then return { error = "text required" } end
 	c.lastSeen = GetTime()
-	c.messages[#c.messages + 1] = { role = "agent", text = p.text, time = os.time() }
+	c.messages[#c.messages + 1] = { role = "agent", text = p.text, time = os.time(), revealAt = GetTime(),
+		thoughts = c.thinking and #c.thinking.steps > 0 and c.thinking.steps or nil }
 	c.delivered = #c.messages
-	c.status = nil
+	c.thinking = nil
 	return { ok = true }
 end
 
 function methods.chat_status(p)
 	local c = chat()
 	c.lastSeen = GetTime()
-	c.status = (type(p.text) == "string" and p.text ~= "") and p.text or nil
+	if type(p.text) ~= "string" or not p.text:match("%S") then return { ok = true } end
+	c.thinking = c.thinking or { steps = {}, since = GetTime() }
+	local steps = c.thinking.steps
+	if steps[#steps] ~= p.text then steps[#steps + 1] = p.text end
 	return { ok = true }
 end
 
