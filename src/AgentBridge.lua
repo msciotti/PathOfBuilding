@@ -1346,6 +1346,222 @@ function methods.import_character(p)
 	end }
 end
 
+local VARIANT_STATS = { "SkillTotalDPS", "TotalEHP", "Life", "LifeUnreserved", "ManaUnreserved", "FireResist", "ColdResist",
+	"LightningResist", "ChaosResist", "PhysicalMaximumHitTaken", "FireMaximumHitTaken", "ColdMaximumHitTaken",
+	"LightningMaximumHitTaken", "ChaosMaximumHitTaken" }
+local MAX_VARIANTS = 40
+
+local function findNodes(spec, want)
+	local id = tonumber(want)
+	if id then return { spec.nodes[id] } end
+	local found = {}
+	for _, n in pairs(spec.nodes) do
+		if n.dn and n.dn:lower() == tostring(want):lower() and not n.isProxy and n.group then found[#found + 1] = n end
+	end
+	return found
+end
+
+local function newGem(spec, level, quality)
+	local name, lvl, q = tostring(spec):match("^([^:]+):?(%d*):?(%d*)$")
+	return { nameSpec = name, level = tonumber(lvl) or level or 20, quality = tonumber(q) or quality or 20, enabled = true,
+		enableGlobal1 = true, enableGlobal2 = true, count = 1, qualityId = "Default" }
+end
+
+local function processGroup(b, group)
+	b.skillsTab:ProcessSocketGroup(group)
+	for _, gem in ipairs(group.gemList) do
+		if gem.errMsg then error(gem.nameSpec .. ": " .. gem.errMsg, 0) end
+	end
+end
+
+local function socketGroup(b, n)
+	local group = b.skillsTab.socketGroupList[tonumber(n) or 0]
+	if not group then error("no socket group " .. tostring(n), 0) end
+	return group
+end
+
+-- Applies one change to the build and pushes its undo onto `undo`; mod lines go to `lines` for evalMods.
+local function applyChange(b, change, undo, lines, unsupported, roll)
+	local items, spec = b.itemsTab, b.spec
+	local function saveTree()
+		if not undo.tree then
+			local state = spec:CreateUndoState()
+			undo.tree = true
+			undo[#undo + 1] = function() spec:RestoreUndoState(state) end
+		end
+	end
+	if change.equip then
+		local slot = items.slots[change.equip.slot]
+		if not slot then error("unknown slot " .. tostring(change.equip.slot), 0) end
+		local item = new("Item"):Item(tostring(change.equip.item))
+		if not item.base then error("unknown item base in the item text", 0) end
+		if not items:IsItemValidForSlot(item, slot.slotName) then error(item.baseName .. " can't go in " .. slot.slotName, 0) end
+		items:AddItem(item, true)
+		local prev = slot.selItemId
+		undo[#undo + 1] = function()
+			slot:SetSelItemId(prev)
+			items:DeleteItem(item, true)
+			items:PopulateSlots()
+		end
+		slot:SetSelItemId(item.id)
+		items:PopulateSlots()
+	elseif change.unequip then
+		local slot = items.slots[change.unequip]
+		if not slot then error("unknown slot " .. tostring(change.unequip), 0) end
+		local prev = slot.selItemId
+		undo[#undo + 1] = function() slot:SetSelItemId(prev) items:PopulateSlots() end
+		slot:SetSelItemId(0)
+		items:PopulateSlots()
+	elseif change.gems then
+		local group = socketGroup(b, change.gems.group)
+		local prev = group.gemList
+		undo[#undo + 1] = function() group.gemList = prev end
+		group.gemList = {}
+		for _, g in ipairs(change.gems.gems or {}) do group.gemList[#group.gemList + 1] = newGem(g) end
+		processGroup(b, group)
+	elseif change.swapGem then
+		local c = change.swapGem
+		local group = socketGroup(b, c.group)
+		local prev = group.gemList
+		undo[#undo + 1] = function() group.gemList = prev end
+		local at
+		for i, gem in ipairs(prev) do
+			if c.from and gem.nameSpec:lower() == tostring(c.from):lower() then at = i break end
+		end
+		if c.from and not at then error("no gem '" .. c.from .. "' in socket group " .. c.group, 0) end
+		group.gemList = {}
+		for i, gem in ipairs(prev) do group.gemList[i] = gem end
+		if c.to then
+			local old = at and prev[at]
+			local gem = newGem(c.to, c.level or old and old.level, c.quality or old and old.quality)
+			gem.level, gem.quality = c.level or gem.level, c.quality or gem.quality
+			group.gemList[at or #group.gemList + 1] = gem
+		elseif at then
+			table.remove(group.gemList, at)
+		else
+			error("swapGem needs `from` or `to`", 0)
+		end
+		processGroup(b, group)
+	elseif change.allocate then
+		saveTree()
+		for _, want in ipairs(change.allocate) do
+			local nodes = findNodes(spec, want)
+			if #nodes == 0 then error("unknown node " .. tostring(want), 0) end
+			local best
+			for _, n in ipairs(nodes) do
+				if n.alloc then best = nil break end
+				if n.path and (not best or #n.path < #best.path) then best = n end
+			end
+			if best then
+				if best.type == "Mastery" then error("mastery nodes need an effect choice, which compare_variants can't set", 0) end
+				spec:AllocNode(best)
+			elseif not nodes[1].alloc then
+				error("no path to " .. tostring(want), 0)
+			end
+		end
+	elseif change.deallocate then
+		saveTree()
+		for _, want in ipairs(change.deallocate) do
+			local nodes = findNodes(spec, want)
+			if #nodes == 0 then error("unknown node " .. tostring(want), 0) end
+			for _, n in ipairs(nodes) do
+				if n.alloc then spec:DeallocNode(n) end
+			end
+		end
+		spec:BuildAllDependsAndPaths()
+	elseif change.config then
+		local input = b.configTab.configSets[b.configTab.activeConfigSetId].input
+		for var, value in pairs(change.config) do
+			local opt
+			for _, o in ipairs(configOptions()) do
+				if o.var == var then opt = o break end
+			end
+			if not opt then error("unknown config option " .. tostring(var), 0) end
+			if opt.type == "check" then
+				value = value and value ~= 0 or false
+			elseif opt.type == "list" then
+				local known
+				for _, entry in ipairs(opt.list) do
+					if entry.val == value then known = true end
+				end
+				if not known then error("invalid value for config option " .. var, 0) end
+			elseif type(value) ~= "number" and opt.type ~= "text" then
+				error("config option " .. var .. " takes a number", 0)
+			end
+			local prev = input[var]
+			undo[#undo + 1] = function() input[var] = prev end
+			input[var] = value
+		end
+	elseif change.mods then
+		for _, l in ipairs(change.mods) do
+			local r = parseLine(l, roll)
+			lines[#lines + 1] = r.resolved or l
+			if not r.supported then unsupported[#unsupported + 1] = l end
+		end
+	else
+		error("unknown change type", 0)
+	end
+end
+
+-- The variant's changes are applied, evaluated and undone again; `raw` carries the unrounded stats for the deltas.
+local function variantRow(b, variant, want, roll)
+	local undo, lines, unsupported = {}, {}, {}
+	local ok, err = pcall(function()
+		for _, change in ipairs(variant.changes or {}) do
+			applyChange(b, change, undo, lines, unsupported, roll)
+		end
+	end)
+	local row
+	if ok then
+		local okEval, after, _, components = evalMods(b, lines)
+		if okEval then
+			local warnings, feasible = setupWarnings(b, after)
+			local unsourced = unsourcedConfig(b, after, lines)
+			addConfigWarnings(warnings, unsourced)
+			local stats = {}
+			for _, k in ipairs(want) do stats[k] = jsonNumber(after[k]) end
+			row = { stats = stats, skillTotal = components, warnings = warnings, feasible = feasible, unsourcedConfig = unsourced,
+				unsupported = #unsupported > 0 and unsupported or nil, raw = after }
+		else
+			err = after
+		end
+	end
+	for i = #undo, 1, -1 do
+		local okU, errU = pcall(undo[i])
+		if not okU then err = (err and tostring(err) .. "; " or "") .. "restore failed: " .. tostring(errU) end
+	end
+	if not row then row = { error = tostring(err) } end
+	row.name = variant.name
+	return row
+end
+
+function methods.compare_variants(p)
+	local b = env().build
+	if not b then return { error = "no build loaded" } end
+	if type(p.variants) ~= "table" or #p.variants == 0 then return { error = "variants required" } end
+	if #p.variants > MAX_VARIANTS then return { error = "at most " .. MAX_VARIANTS .. " variants per call" } end
+	local want = p.stats or VARIANT_STATS
+	local base = variantRow(b, { name = "baseline" }, want, p.roll)
+	if base.error then return { error = base.error } end
+	local rows = {}
+	for i, v in ipairs(p.variants) do
+		v.name = v.name or ("variant " .. i)
+		local row = variantRow(b, v, want, p.roll)
+		if row.raw then
+			row.delta = {}
+			for _, k in ipairs(want) do
+				if type(base.raw[k]) == "number" and type(row.raw[k]) == "number" then row.delta[k] = jsonNumber(row.raw[k] - base.raw[k]) end
+			end
+		end
+		row.raw = nil
+		rows[i] = row
+	end
+	base.raw = nil
+	pcall(recalc, b)
+	b:RefreshStatList()
+	return { baseline = base, variants = rows }
+end
+
 -- Chat: the in-app Agent tab queues user messages here; an external agent long-polls chat_wait and answers
 -- with chat_reply. State lives on `launch` so it survives `reload` (which swaps this module's upvalues).
 local function chat()
