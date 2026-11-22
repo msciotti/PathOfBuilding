@@ -108,6 +108,18 @@ function methods.restart()
 	return { restarting = true }
 end
 
+-- Dev mode only: run a Lua chunk with `build`, `main`, `data` in scope and return its (JSON-able) result.
+function methods.eval(p)
+	if not (launch and launch.devMode) then return { error = "eval requires dev mode" } end
+	local fn, err = loadstring(p.code or "", "eval")
+	if not fn then return { error = err } end
+	local e = env()
+	setfenv(fn, setmetatable({ build = e.build, main = e.main, data = e.data, json = json }, { __index = _G }))
+	local ok, res = pcall(fn)
+	if not ok then return { error = tostring(res) } end
+	return { value = project(res, tonumber(p.depth) or 6, {}, tonumber(p.maxKeys) or 5000) }
+end
+
 function methods.list_sources()
 	return { sources = AgentData.listSources(getIndex()) }
 end
@@ -1070,6 +1082,69 @@ function methods.effect_stats(p)
 	end
 	return { probed = c, unsupportedByParser = unsupported, conditional = conditional, noEffect = noeff, errors = errs,
 		statsMoved = statCounts }
+end
+
+-- params: { account = "Name#1234", character = "...", realm = "pc", name = build file name (default "<account> - <character>") }.
+-- Same as New build + Import/Export Build > character import (tree, jewels, items, skills), then saves the build. The
+-- current build is left as it is on disk: save it first if it has changes.
+function methods.import_character(p)
+	local main = env().main
+	if not main then return { error = "PoB not ready" } end
+	if type(p.account) ~= "string" or type(p.character) ~= "string" then return { error = "account and character required" } end
+	local realm = p.realm or "pc"
+	local host = "https://www.pathofexile.com/character-window/"
+	local acct = p.account:gsub("#", "%%23")
+	local name = p.name or (p.account:gsub("#%d+$", "") .. " - " .. p.character)
+	local fetched, err = {}, nil
+	local function fetch(key, url)
+		launch:DownloadPage(url, function(response, errMsg)
+			if errMsg then err = key .. ": " .. errMsg
+			elseif not response.body or response.body == "false" then err = key .. ": no data (profile private or character not found?)"
+			else fetched[key] = json.decode(response.body) end
+		end)
+	end
+	fetch("list", host .. "get-characters?accountName=" .. acct .. "&realm=" .. realm)
+	fetch("passives", host .. "get-passive-skills?accountName=" .. acct .. "&character=" .. urlEncode(p.character) .. "&realm=" .. realm)
+	fetch("items", host .. "get-items?accountName=" .. acct .. "&character=" .. urlEncode(p.character) .. "&realm=" .. realm)
+	local oldImportTab = env().build and env().build.importTab
+	local deadline = GetTime() + 60000
+	local switched = false
+	return { _defer = function()
+		if err then return { error = err } end
+		if GetTime() > deadline then return { error = "timed out" } end
+		if not (fetched.list and fetched.passives and fetched.items) then return nil end
+		local charInfo
+		for _, c in ipairs(fetched.list) do
+			if c.name == p.character then charInfo = c end
+		end
+		if not charInfo then return { error = "character not found on account" } end
+		if not switched then
+			main:SetMode("BUILD", false, "Unnamed build")
+			switched = true
+			return nil
+		end
+		local b = env().build
+		if main.newMode or not b or b.importTab == oldImportTab then return nil end
+		local tab = b.importTab
+		-- Account-name imports omit quest choices, so keep the new build's defaults (as the Import tab does)
+		local passives = fetched.passives
+		passives.bandit_choice = passives.bandit_choice or b.configTab.input.bandit
+		passives.pantheon_major = passives.pantheon_major or b.configTab.input.pantheonMajorGod
+		passives.pantheon_minor = passives.pantheon_minor or b.configTab.input.pantheonMinorGod
+		local charData = copyTable(charInfo)
+		charData.passives = passives
+		charData.jewels = fetched.passives.items
+		tab:ImportPassiveTreeAndJewels(charData, true)
+		local itemData = copyTable(charInfo)
+		itemData.equipment = fetched.items.items
+		itemData.guardian = fetched.items.guardian
+		tab:ImportItemsAndSkills(itemData, true, true, false)
+		b.buildName = name
+		b.dbFileName = main.buildPath .. name:gsub("[\\/:%*%?\"<>|%c]", "-") .. ".xml"
+		b:SaveDBFile()
+		b.spec:SetWindowTitleWithBuildClass()
+		return { imported = true, file = b.dbFileName, class = charInfo.class, league = charInfo.league, level = charInfo.level }
+	end }
 end
 
 -- Chat: the in-app Agent tab queues user messages here; an external agent long-polls chat_wait and answers
