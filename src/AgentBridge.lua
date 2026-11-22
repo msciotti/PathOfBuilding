@@ -239,15 +239,21 @@ local function mainSkillInfo(b)
 		types = types }
 end
 
+local setupWarnings, unsourcedConfig, addConfigWarnings
+
 function methods.get_state()
 	local b = env().build
 	if not b then return { error = "no build loaded" } end
 	local stats, components = currentStats(b)
+	local unsourced = unsourcedConfig(b, stats)
+	local warnings, feasible = setupWarnings(b, stats)
+	addConfigWarnings(warnings, unsourced)
 	return {
 		class = b.spec and b.spec.curClassName, ascendancy = b.spec and b.spec.curAscendClassName,
 		level = b.characterLevel, mainSkill = mainSkillInfo(b),
 		dpsHint = "Use SkillTotalDPS as the DPS goal: it adds up the parts of a multi-part skill that happen on one use (Molten Strike) and equals CombinedDPS otherwise. CombinedDPS is only the selected skill part; TotalDPS is hits only. FullDPS is only set when skills are marked for Full DPS; PoisonDPS/BleedDPS are per stack, so use WithPoisonDPS/WithBleedDPS or CombinedDPS.",
 		skillTotal = { combined = components ~= nil, components = components },
+		warnings = warnings, feasible = feasible, unsourcedConfig = unsourced,
 		stats = stats,
 	}
 end
@@ -400,13 +406,16 @@ local function recalc(b, extra, totalsFor)
 		if m.config and configSaved[m.config] == nil then
 			configSaved[m.config] = input[m.config] or false
 			input[m.config] = true
+		elseif m.configOff and configSaved[m.configOff] == nil then
+			configSaved[m.configOff] = input[m.configOff] or false
+			input[m.configOff] = nil
 		end
 	end
 	b.configTab:BuildModList()
 	for var, old in pairs(configSaved) do input[var] = old or nil end
 	local flaskSlots = {}
 	for _, m in ipairs(extra or {}) do
-		if m.config then
+		if m.config or m.configOff then
 		elseif m.raw then
 			b.configTab.modList:AddMod(m.raw)
 		elseif m.clear then
@@ -506,6 +515,174 @@ local function assumedNames(assume)
 	return names
 end
 
+local function chargeSource(charge)
+	return {
+		text = { "gain[^%.]-" .. charge .. "[%a, ]-charge", "steal[^%.]-" .. charge .. "[%a, ]-charge" },
+		notText = { "per ", "cannot gain", "when you gain", "would gain", "instead gain", "minion", "enemies", "while you have" },
+		gemStat = { "gain_" .. charge .. "_charge", "grant_" .. charge .. "_charge", "add_" .. charge .. "_charge", "grants_x_additional_" .. charge .. "_charge" },
+	}
+end
+
+local function ailmentSource(ailment)
+	return {
+		text = { "chance to " .. ailment, ailment .. " enem", "always " .. ailment, "inflicts? " .. ailment, "can " .. ailment },
+		notText = { "cannot", "avoid" },
+		gemStat = { "chance_to_" .. ailment, "always_" .. ailment },
+	}
+end
+
+-- Config options that only mean something when the build can produce the effect. `text` and `notText` are Lua
+-- patterns on the lowercased mod lines of equipped items and allocated nodes (masteries included), `gems` are gem
+-- names and `gemStat` patterns on stat ids of the socketed gems. `flags` are the skill flags PoB itself sets for such
+-- a source (the same test the Config tab uses to show an option),
+-- `skillTypes` and `skillsFromOption` (the option's own ifSkill list) match active skills.
+local CONFIG_SOURCES = {
+	buffFortification = { text = { "fortify%f[%A]", "gain %d+ fortification", "you have your maximum fortification" },
+		notText = { "while you have fortify", "while fortified" }, gems = { "Fortify", "Vigilant Strike" } },
+	useEnduranceCharges = chargeSource("endurance"),
+	useFrenzyCharges = chargeSource("frenzy"),
+	usePowerCharges = chargeSource("power"),
+	buffOnslaught = { text = { "gain[^%.]-onslaught", "grants? onslaught", "you have onslaught" },
+		notText = { "minion", "effect of onslaught", "while you have onslaught", "during onslaught" }, gems = { "Manifest Dancing Dervishes" } },
+	multiplierRage = { flags = { "Condition:CanGainRage" } },
+	bloodSandStance = { skillsFromOption = true },
+	conditionEnemyShocked = ailmentSource("shock"),
+	conditionEnemyChilled = ailmentSource("chill"),
+	conditionEnemyIgnited = ailmentSource("ignite"),
+	conditionEnemyIntimidated = { text = { "intimidate enem", "are intimidated", "chance to intimidate" },
+		gems = { "Intimidating Cry" }, gemStat = { "chance_to_intimidate" } },
+	conditionEnemyUnnerved = { text = { "unnerve enem", "are unnerved", "chance to unnerve" }, gemStat = { "chance_to_unnerve" } },
+	conditionEnemyCoveredInAsh = { text = { "in ash" }, gemStat = { "cover_in_ash" } },
+	conditionEnemyFireExposure = { flags = { "applyFireExposure" } },
+	conditionEnemyColdExposure = { flags = { "applyColdExposure" } },
+	conditionEnemyLightningExposure = { flags = { "applyLightningExposure" } },
+	buffElusive = { flags = { "Condition:CanBeElusive" } },
+	buffTailwind = { text = { "gain tailwind", "grants? tailwind", "have tailwind" }, notText = { "while you have tailwind", "effect of tailwind" } },
+	buffAdrenaline = { text = { "gain adrenaline", "grants? adrenaline", "have adrenaline" },
+		notText = { "when you gain adrenaline", "while you have" }, gems = { "Fresh Meat" } },
+	buffArcaneSurge = { text = { "gain arcane surge", "grants? arcane surge", "have arcane surge" },
+		notText = { "while you have", "arcane surge also" }, gems = { "Arcane Surge" } },
+	buffPhasing = { text = { "gain phasing", "grants? phasing", "you have phasing" }, notText = { "while you have phasing" }, gems = { "Phase Run" } },
+	buffUnholyMight = { text = { "gain unholy might", "grants? unholy might", "have unholy might" }, notText = { "minion" } },
+	conditionEnemyCursed = { text = { "curse enem" }, gems = { "Hextouch" }, skillTypes = { "Hex", "Mark", "AppliesCurse" } },
+}
+
+local function anyFind(patterns, s)
+	for _, pat in ipairs(patterns or {}) do
+		if s:find(pat) then return true end
+	end
+	return false
+end
+
+-- What the build provides: mod lines of equipped items and allocated nodes, plus gem names and stat ids.
+local function buildSources(b)
+	local env_ = b.calcsTab.mainEnv
+	local src = { lines = {}, gems = {}, stats = {} }
+	for _, item in pairs(env_.player.itemList) do
+		for key, list in pairs(item) do
+			if type(key) == "string" and key:match("ModLines$") then
+				for _, modLine in ipairs(list) do
+					if item:CheckModLineVariant(modLine) then src.lines[#src.lines + 1] = StripEscapes(modLine.line):lower() end
+				end
+			end
+		end
+	end
+	for _, node in pairs(env_.allocNodes) do
+		for _, line in ipairs(node.sd or {}) do src.lines[#src.lines + 1] = StripEscapes(line):lower() end
+	end
+	local function addGem(effect)
+		local ge = effect.grantedEffect
+		src.gems[ge.name] = true
+		for _, id in ipairs(ge.stats or {}) do src.stats[#src.stats + 1] = id end
+		for _, stat in ipairs(ge.constantStats or {}) do src.stats[#src.stats + 1] = stat[1] end
+	end
+	for _, skill in ipairs(env_.player.activeSkillList) do
+		addGem(skill.activeEffect)
+		for _, support in ipairs(skill.supportList or {}) do addGem(support) end
+	end
+	return src
+end
+
+local function hasSource(b, opt, def, have)
+	local env_ = b.calcsTab.mainEnv
+	local main = env_.player.mainSkill
+	for _, line in ipairs(have.lines) do
+		if anyFind(def.text, line) and not anyFind(def.notText, line) then return true end
+	end
+	for _, name in ipairs(def.gems or {}) do
+		if have.gems[name] then return true end
+	end
+	for _, id in ipairs(have.stats) do
+		if anyFind(def.gemStat, id) then return true end
+	end
+	for _, flag in ipairs(def.flags or {}) do
+		if main.skillFlags[flag] or main.skillModList:Flag(nil, flag) then return true end
+	end
+	for _, name in ipairs(def.skillsFromOption and opt.ifSkill or {}) do
+		if env_.skillsUsed[name] then return true end
+	end
+	for _, skill in ipairs(env_.player.activeSkillList) do
+		for _, typeName in ipairs(def.skillTypes or {}) do
+			if skill.skillTypes[SkillType[typeName]] then return true end
+		end
+	end
+	return false
+end
+
+-- Config options that are switched on while nothing in the build provides them, with DPS and EHP as if each were
+-- off. `on` is the stats of the state being checked; `lines`/`extra` re-create that state for each recalculation.
+function unsourcedConfig(b, on, lines, extra)
+	local input = b.configTab.configSets[b.configTab.activeConfigSetId].input
+	local have
+	local out = {}
+	for _, opt in ipairs(configOptions()) do
+		local def = opt.var and CONFIG_SOURCES[opt.var]
+		local value = input[opt.var]
+		if def and value and value ~= 0 then
+			have = have or buildSources(b)
+			if not hasSource(b, opt, def, have) then
+				local entries = {}
+				for i, m in ipairs(extra or {}) do entries[i] = m end
+				entries[#entries + 1] = { configOff = opt.var }
+				local ok, after = evalMods(b, lines or {}, entries)
+				out[#out + 1] = { option = StripEscapes(opt.label):gsub(":$", ""), var = opt.var,
+					dps = on.SkillTotalDPS, dpsOff = ok and after.SkillTotalDPS or nil,
+					ehp = on.TotalEHP, ehpOff = ok and after.TotalEHP or nil }
+			end
+		end
+	end
+	if #out > 0 then pcall(recalc, b) end
+	return out
+end
+
+function addConfigWarnings(warnings, unsourced)
+	for _, u in ipairs(unsourced) do
+		warnings[#warnings + 1] = string.format("Config option '%s' is on but nothing in the build provides it", u.option)
+	end
+end
+
+-- Costs the main skill can't pay: mana (energy shield included where it pays for mana) and life.
+local function unpayable(stats)
+	local out = {}
+	if (stats.ManaCost or 0) > (stats.ManaCostPayablePool or stats.ManaUnreserved or 0) then
+		out[#out + 1] = string.format("The main skill costs %d Mana per use but only %d Mana is unreserved", stats.ManaCost, stats.ManaCostPayablePool or stats.ManaUnreserved or 0)
+	end
+	if (stats.LifeCost or 0) > (stats.LifeUnreserved or 0) then
+		out[#out + 1] = string.format("The main skill costs %d Life per use but only %d Life is unreserved", stats.LifeCost, stats.LifeUnreserved or 0)
+	end
+	return out
+end
+
+-- PoB's own sidebar warnings for the state as last calculated (refreshing the sidebar), then ours.
+function setupWarnings(b, stats)
+	b:RefreshStatList()
+	local warnings = {}
+	for _, line in ipairs(b.controls.warnings.lines) do warnings[#warnings + 1] = StripEscapes(line) end
+	local costs = unpayable(stats)
+	for _, line in ipairs(costs) do warnings[#warnings + 1] = line end
+	return warnings, #costs == 0
+end
+
 function methods.what_if(p)
 	local b = env().build
 	if not b then return { error = "no build loaded" } end
@@ -566,6 +743,8 @@ function methods.what_if(p)
 	local totalsBefore = modTotals(b, names)
 	local flagsBefore = copyTable((mainSkill(b) or {}).skillFlags or {}, true)
 	local ok, after, totalsAfter, afterComponents = evalMods(b, lines, socketedMods, names)
+	local warnings, feasible
+	if ok then warnings, feasible = setupWarnings(b, after) end
 	for _, m in ipairs(socketedMods) do table.insert(assume, 1, m) end
 	if ok then
 		local flagsAfter = (mainSkill(b) or {}).skillFlags or {}
@@ -601,7 +780,10 @@ function methods.what_if(p)
 		end
 	end
 	local ok2 = pcall(recalc, b)
+	b:RefreshStatList()
 	if not ok then return { error = tostring(after) } end
+	local unsourced = unsourcedConfig(b, after, lines, socketedMods)
+	addConfigWarnings(warnings, unsourced)
 
 	local diff = diffStats(base, after, want)
 	local current, changedOther
@@ -662,7 +844,7 @@ function methods.what_if(p)
 			totalParts.components[i] = { part = c.part, name = c.name, before = c.dps, after = afterComponents[i].dps }
 		end
 	end
-	return { applied = lines, changed = diff, skillTotal = totalParts, current = current, requires = #reqs > 0 and reqs or nil,
+	return { applied = lines, changed = diff, warnings = warnings, feasible = feasible, unsourcedConfig = unsourced, skillTotal = totalParts, current = current, requires = #reqs > 0 and reqs or nil,
 		ifConditionsMet = met, modTotals = totals, socketedAppliedTo = #socketedInfo > 0 and socketedInfo or nil, changedOther = changedOther, capped = #capped > 0 and capped or nil, unsupported = #unsupported > 0 and unsupported or nil, restored = ok2, note = note }
 end
 
@@ -768,6 +950,10 @@ function methods.rank_options(p)
 	for _, k in ipairs(p.stats or {}) do show[#show + 1] = k end
 
 	local base = currentStats(b)
+	local unsourced = unsourcedConfig(b, base)
+	local warnings, feasible = setupWarnings(b, base)
+	addConfigWarnings(warnings, unsourced)
+	local infeasible, infeasibleCount = {}, 0
 	local bestLvl = {}
 	for _, e in ipairs(res) do
 		if e.group then
@@ -892,14 +1078,21 @@ function methods.rank_options(p)
 						requires[#requires + 1] = q.desc .. (q.metOnBuild and " (met)" or q.metOnBuild == false and " (not met)" or "")
 					end
 				end
-				rows[#rows + 1] = { src = e.src, name = e.name or e.id, id = e.id, mods = mods, matchedLinesOnly = partial, unsupported = unsupported, requires = requires,
-					spawnOn = e.spawnOn, score = score, statsChanged = changed, stats = deltas, skillParts = components, assumed = assumed,
-					alsoFrom = seen[text], obtain = e.obtain, pathDist = status and status.pathDist,
-					alreadyOnBuild = status and status.allocated or nil }
+				local problems = unpayable(after)
+				if #problems == 0 then
+					rows[#rows + 1] = { src = e.src, name = e.name or e.id, id = e.id, mods = mods, matchedLinesOnly = partial, unsupported = unsupported, requires = requires,
+						spawnOn = e.spawnOn, score = score, statsChanged = changed, stats = deltas, skillParts = components, assumed = assumed,
+						alsoFrom = seen[text], obtain = e.obtain, pathDist = status and status.pathDist,
+						alreadyOnBuild = status and status.allocated or nil }
+				elseif changed > 0 then
+					infeasibleCount = infeasibleCount + 1
+					if #infeasible < 10 then infeasible[#infeasible + 1] = { src = e.src, name = e.name or e.id, warnings = problems } end
+				end
 			end
 		end
 	end
 	pcall(recalc, b)
+	b:RefreshStatList()
 	local useGoal = next(goal) ~= nil
 	table.sort(rows, function(x, y)
 		if useGoal and x.score ~= y.score then return x.score > y.score end
@@ -914,6 +1107,8 @@ function methods.rank_options(p)
 	end
 	return { candidates = total, evaluated = evaluated, duplicatesSkipped = skipped, timedOut = timedOut, noEffect = noEffect,
 		seconds = os.clock() - t0, roll = p.roll or "max", ranked = top,
+		warnings = warnings, feasible = feasible, unsourcedConfig = unsourced,
+		infeasible = infeasibleCount > 0 and { count = infeasibleCount, examples = infeasible } or nil,
 		alreadyOnBuildIf = #fromAssumptionsAlone > 0 and fromAssumptionsAlone or nil,
 		alreadyAllocated = #allocatedSkipped > 0 and allocatedSkipped or nil,
 		note = "Rows with `assumed` only score that way once those conditions hold (flask active, aura on, threshold reached...). "
