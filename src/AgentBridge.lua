@@ -1361,16 +1361,26 @@ local function findNodes(spec, want)
 	return found
 end
 
+-- Without a level the gem gets its natural max level once processGroup has looked it up.
 local function newGem(spec, level, quality)
 	local name, lvl, q = tostring(spec):match("^([^:]+):?(%d*):?(%d*)$")
-	return { nameSpec = name, level = tonumber(lvl) or level or 20, quality = tonumber(q) or quality or 20, enabled = true,
-		enableGlobal1 = true, enableGlobal2 = true, count = 1, qualityId = "Default" }
+	local explicit = tonumber(lvl) or level
+	return { nameSpec = name, level = explicit or 1, quality = tonumber(q) or quality or 20, enabled = true,
+		enableGlobal1 = true, enableGlobal2 = true, count = 1, qualityId = "Default" }, not explicit
 end
 
-local function processGroup(b, group)
+-- `touched` lists the new gems ({ gem, auto }); processGroup fills in their levels and reports what was used.
+local function processGroup(b, group, touched, used)
 	b.skillsTab:ProcessSocketGroup(group)
-	for _, gem in ipairs(group.gemList) do
-		if gem.errMsg then error(gem.nameSpec .. ": " .. gem.errMsg, 0) end
+	for _, t in ipairs(touched) do
+		if t.gem.errMsg then error(t.gem.nameSpec .. ": " .. t.gem.errMsg, 0) end
+		if t.auto and t.gem.gemData then t.gem.level = t.gem.gemData.naturalMaxLevel end
+	end
+	b.skillsTab:ProcessSocketGroup(group)
+	for _, t in ipairs(touched) do
+		local max = t.gem.gemData and t.gem.gemData.naturalMaxLevel
+		used[#used + 1] = { name = t.gem.nameSpec, level = t.gem.level, quality = t.gem.quality,
+			needsCorruption = max and t.gem.level > max or nil }
 	end
 end
 
@@ -1381,7 +1391,7 @@ local function socketGroup(b, n)
 end
 
 -- Applies one change to the build and pushes its undo onto `undo`; mod lines go to `lines` for evalMods.
-local function applyChange(b, change, undo, lines, unsupported, roll)
+local function applyChange(b, change, undo, lines, unsupported, roll, used)
 	local items, spec = b.itemsTab, b.spec
 	local function saveTree()
 		if not undo.tree then
@@ -1417,8 +1427,13 @@ local function applyChange(b, change, undo, lines, unsupported, roll)
 		local prev = group.gemList
 		undo[#undo + 1] = function() group.gemList = prev end
 		group.gemList = {}
-		for _, g in ipairs(change.gems.gems or {}) do group.gemList[#group.gemList + 1] = newGem(g) end
-		processGroup(b, group)
+		local touched = {}
+		for _, g in ipairs(change.gems.gems or {}) do
+			local gem, auto = newGem(g)
+			group.gemList[#group.gemList + 1] = gem
+			touched[#touched + 1] = { gem = gem, auto = auto }
+		end
+		processGroup(b, group, touched, used)
 	elseif change.swapGem then
 		local c = change.swapGem
 		local group = socketGroup(b, c.group)
@@ -1431,17 +1446,17 @@ local function applyChange(b, change, undo, lines, unsupported, roll)
 		if c.from and not at then error("no gem '" .. c.from .. "' in socket group " .. c.group, 0) end
 		group.gemList = {}
 		for i, gem in ipairs(prev) do group.gemList[i] = gem end
+		local touched = {}
 		if c.to then
-			local old = at and prev[at]
-			local gem = newGem(c.to, c.level or old and old.level, c.quality or old and old.quality)
-			gem.level, gem.quality = c.level or gem.level, c.quality or gem.quality
+			local gem, auto = newGem(c.to, c.level, c.quality)
 			group.gemList[at or #group.gemList + 1] = gem
+			touched[1] = { gem = gem, auto = auto }
 		elseif at then
 			table.remove(group.gemList, at)
 		else
 			error("swapGem needs `from` or `to`", 0)
 		end
-		processGroup(b, group)
+		processGroup(b, group, touched, used)
 	elseif change.allocate then
 		saveTree()
 		for _, want in ipairs(change.allocate) do
@@ -1505,10 +1520,10 @@ end
 
 -- The variant's changes are applied, evaluated and undone again; `raw` carries the unrounded stats for the deltas.
 local function variantRow(b, variant, want, roll)
-	local undo, lines, unsupported = {}, {}, {}
+	local undo, lines, unsupported, used = {}, {}, {}, {}
 	local ok, err = pcall(function()
 		for _, change in ipairs(variant.changes or {}) do
-			applyChange(b, change, undo, lines, unsupported, roll)
+			applyChange(b, change, undo, lines, unsupported, roll, used)
 		end
 	end)
 	local row
@@ -1520,7 +1535,7 @@ local function variantRow(b, variant, want, roll)
 			addConfigWarnings(warnings, unsourced)
 			local stats = {}
 			for _, k in ipairs(want) do stats[k] = jsonNumber(after[k]) end
-			row = { stats = stats, skillTotal = components, warnings = warnings, feasible = feasible, unsourcedConfig = unsourced,
+			row = { stats = stats, skillTotal = components, gems = #used > 0 and used or nil, warnings = warnings, feasible = feasible, unsourcedConfig = unsourced,
 				unsupported = #unsupported > 0 and unsupported or nil, raw = after }
 		else
 			err = after
