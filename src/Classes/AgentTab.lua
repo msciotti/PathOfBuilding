@@ -6,11 +6,15 @@
 local t_insert = table.insert
 local m_max = math.max
 local m_floor = math.floor
+local m_min = math.min
 
 local TEXT_HEIGHT = 16
 local PAD = 6
 local HEADER = 28
-local FOOTER = 50
+local FOOTER = 34
+local PANEL_LAYER = 50 -- above tree art (sublayers up to 30), below tooltips (100)
+local REVEAL_CPS = 400 -- reply "typing" speed in chars per second, capped so long replies finish within REVEAL_MAX ms
+local REVEAL_MAX = 3000
 
 ---@class AgentTab: ControlHost, Control
 local AgentTabClass = newClass("AgentTab", "ControlHost", "Control")
@@ -31,7 +35,7 @@ function AgentTabClass:AgentTab(build)
 		if chat then
 			chat.messages = { }
 			chat.delivered = 0
-			chat.status = nil
+			chat.thinking = nil
 		end
 	end)
 	self.controls.clear.tooltipText = "Clear the chat transcript."
@@ -108,26 +112,74 @@ local function wrapParagraph(lines, str, width, prefix)
 	end
 end
 
-function AgentTabClass:WrapTranscript(chat, width)
-	local last = chat.messages[#chat.messages]
-	local key = #chat.messages..":"..width..":"..(last and #last.text or 0)
-	if self.wrapKey == key then
-		return self.wrapped
+local function revealed(msg)
+	if msg.role ~= "agent" or not msg.revealAt then
+		return #msg.text
 	end
-	self.wrapKey = key
-	local lines = { }
-	for _, msg in ipairs(chat.messages) do
-		if msg.role == "user" then
-			t_insert(lines, colorCodes.MAGIC.."You")
-		else
-			t_insert(lines, colorCodes.UNIQUE.."Agent")
-		end
-		for para in (msg.text.."\n"):gmatch("(.-)\r?\n") do
-			wrapParagraph(lines, para, width, "^7")
-		end
+	local elapsed = GetTime() - msg.revealAt
+	local duration = m_min(REVEAL_MAX, #msg.text / REVEAL_CPS * 1000)
+	if duration <= 0 or elapsed >= duration then
+		msg.revealAt = nil
+		return #msg.text
+	end
+	return m_floor(#msg.text * elapsed / duration)
+end
+
+local function wrapMessage(lines, msg, width, shown)
+	if msg.role == "user" then
+		t_insert(lines, colorCodes.MAGIC.."You")
+	else
+		t_insert(lines, colorCodes.UNIQUE.."Agent")
+	end
+	for _, step in ipairs(msg.thoughts or { }) do
+		wrapParagraph(lines, step, width, "^8  ")
+	end
+	if msg.thoughts then
 		t_insert(lines, "")
 	end
-	self.wrapped = lines
+	for para in (msg.text:sub(1, shown).."\n"):gmatch("(.-)\r?\n") do
+		wrapParagraph(lines, para, width, "^7")
+	end
+	t_insert(lines, "")
+end
+
+function AgentTabClass:WrapTranscript(chat, width)
+	local count = #chat.messages
+	local last = chat.messages[count]
+	local typing = last and last.revealAt ~= nil
+	local settled = typing and count - 1 or count
+	local key = settled..":"..width
+	if self.wrapKey ~= key then
+		self.wrapKey = key
+		self.wrapped = { }
+		for i = 1, settled do
+			wrapMessage(self.wrapped, chat.messages[i], width, #chat.messages[i].text)
+		end
+	end
+	if not typing and not chat.thinking then
+		return self.wrapped
+	end
+	local lines = { }
+	for i, line in ipairs(self.wrapped) do
+		lines[i] = line
+	end
+	if typing then
+		local shown = revealed(last)
+		wrapMessage(lines, last, width, shown)
+		if shown < #last.text then
+			lines[#lines - 1] = lines[#lines - 1].."^8_"
+		end
+	else
+		t_insert(lines, colorCodes.UNIQUE.."Agent")
+		local steps = chat.thinking.steps
+		local dots = string.rep(".", 1 + m_floor(GetTime() / 400) % 3)
+		for i, step in ipairs(steps) do
+			wrapParagraph(lines, step..(i == #steps and dots or ""), width, i == #steps and "^7  " or "^8  ")
+		end
+		if #steps == 0 then
+			t_insert(lines, "^8  Thinking"..dots)
+		end
+	end
 	return lines
 end
 
@@ -190,7 +242,7 @@ function AgentTabClass:Draw(viewPort)
 	local scrollBar = self.controls.scrollBar
 	local boxX, boxY, boxW, boxH = self:TranscriptBox()
 
-	SetDrawLayer(nil, 50)
+	SetDrawLayer(nil, PANEL_LAYER)
 
 	SetDrawColor(0.1, 0.1, 0.1)
 	DrawImage(nil, self.x, self.y, self.width, self.height)
@@ -227,11 +279,15 @@ function AgentTabClass:Draw(viewPort)
 			end
 		end
 		SetViewport()
-		if chat.status then
-			DrawString(boxX, boxY + boxH + 4, "LEFT", 14, "VAR", "^8"..chat.status)
-		end
 	end
 
-	self:DrawControls(viewPort)
+	-- Like DrawControls, but back on the panel's layer before each control: Edit/Button controls reset the
+	-- sublayer to 0 after drawing a hover tooltip, which would put later controls under the panel background
+	for _, control in pairs(self.controls) do
+		if control:IsShown() and control.Draw then
+			SetDrawLayer(nil, PANEL_LAYER)
+			control:Draw(viewPort, self.selControl and self.selControl.hasFocus and self.selControl ~= control)
+		end
+	end
 	SetDrawLayer(nil, 0)
 end
