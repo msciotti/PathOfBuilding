@@ -574,10 +574,12 @@ local function anyFind(patterns, s)
 	return false
 end
 
--- What the build provides: mod lines of equipped items and allocated nodes, plus gem names and stat ids.
-local function buildSources(b)
+-- What the build provides: mod lines of equipped items and allocated nodes (and any hypothetical `lines`), plus gem
+-- names and stat ids.
+local function buildSources(b, lines)
 	local env_ = b.calcsTab.mainEnv
 	local src = { lines = {}, gems = {}, stats = {} }
+	for _, line in ipairs(lines or {}) do src.lines[#src.lines + 1] = StripEscapes(line):lower() end
 	for _, item in pairs(env_.player.itemList) do
 		for key, list in pairs(item) do
 			if type(key) == "string" and key:match("ModLines$") then
@@ -639,7 +641,7 @@ function unsourcedConfig(b, on, lines, extra)
 		local def = opt.var and CONFIG_SOURCES[opt.var]
 		local value = input[opt.var]
 		if def and value and value ~= 0 then
-			have = have or buildSources(b)
+			have = have or buildSources(b, lines)
 			if not hasSource(b, opt, def, have) then
 				local entries = {}
 				for i, m in ipairs(extra or {}) do entries[i] = m end
