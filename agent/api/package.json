@@ -1,0 +1,12 @@
+{
+  "name": "pob-agent",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "agent": "node --env-file-if-exists=.env agent.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.12.0",
+    "ajv": "^8.20.0"
+  }
+}
