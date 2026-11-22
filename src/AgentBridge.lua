@@ -2,7 +2,7 @@
 local json = require("dkjson")
 local AgentData = LoadModule("AgentData")
 
-local M = { port = 49090 }
+local M = { port = tonumber(os.getenv("POB_AGENT_PORT")) or 49090 }
 local idx, idxKey
 
 local function env()

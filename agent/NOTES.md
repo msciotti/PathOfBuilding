@@ -7,7 +7,7 @@ evaluate changes with PoB's own calc engine, from a chat panel inside PoB.
 - `src/AgentData.lua`: one searchable index over item mod pools (including bench mods), passives, mastery effects,
   ascendancies, tattoos, timeless-jewel nodes, uniques, enchants, essences, cluster jewels, item and flask bases,
   pantheon and gems.
-- `src/AgentBridge.lua`: line-delimited JSON-RPC on 127.0.0.1:49090, polled from `launch:OnFrame`. `reload` swaps the
+- `src/AgentBridge.lua`: line-delimited JSON-RPC on 127.0.0.1:49090 (`POB_AGENT_PORT` overrides), polled from `launch:OnFrame`. `reload` swaps the
   RPC handlers; `restart` (F5, dev mode) reloads all Lua.
 - `src/Classes/AgentTab.lua`: the chat panel ("Agent >>" next to Compare).
 - `agent/api/agent.mjs`: the chat agent. It runs on the Claude API with the tools defined in `agent/api/tools.mjs`.
