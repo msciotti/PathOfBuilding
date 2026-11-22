@@ -20,7 +20,7 @@ Keep these small; they are where upstream merges conflict.
 ## Bridge methods
 `ping, reload, restart, list_sources, search, inspect, get_state, what_if, rank_options, path_cost, compare_variants, parse_mod,
 list_stats, probe_batch, find_by_effect, effect_stats, import_character, eval (dev mode), chat_wait, chat_reply,
-chat_status, chat_history`. The agent's tools and their parameters are in `agent/api/tools.mjs`.
+chat_status, chat_history`. The agent's tools and their parameters are in `agent/api/tools.mjs`. Tools with `run` instead of `method` execute in the Node agent (`price_lookup` and `trade_search`, in `market.mjs`) and need no bridge.
 
 - `what_if` adds the mods as a temporary Config custom-mod block, recalculates, diffs `calcsTab.mainOutput` and removes
   the block. When a mod's requirements aren't met as configured, `ifConditionsMet` recalculates with them forced on.
