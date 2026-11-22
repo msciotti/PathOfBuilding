@@ -815,6 +815,9 @@ Huge sets the radius to 11.
 	{ var = "enemyRadius", type = "integer", label = "Enemy radius:", ifSkill = { "Seismic Trap", "Lightning Spire Trap", "Explosive Trap", "Molten Strike", "Ball Lightning" }, includeTransfigured = true, tooltip = "Configure the radius of an enemy hitbox to calculate some area overlapping (shotgunning) effects.", apply = function(val, modList, enemyModList)
 		modList:NewMod("EnemyRadius", "OVERRIDE", m_max(val, 1), "Config")
 	end },
+	{ var = "returningBallHitChance", type = "countAllowZero", label = "Returning ball hit chance (%):", ifSkill = "Molten Strike", ifFlag = "ProjectilesReturn", includeTransfigured = true, defaultPlaceholderState = 50, tooltip = "The chance for a returning ball to hit the enemy on its way back.", apply = function(val, modList, enemyModList)
+		modList:NewMod("ReturningBallHitChance", "BASE", m_min(val, 100), "Config")
+	end },
 	{ var = "TotalMinionLife", type = "integer", label = "Minion Life override:", ifMod = "takenFromMinionBeforeYou", tooltip = "Overrides the automatically calculated Life of the minion supported by Companionship.", apply = function(val, modList, enemyModList)
 		modList:NewMod("TotalMinionLife", "OVERRIDE", val, "Config")
 	end },

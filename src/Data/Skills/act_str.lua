@@ -7863,15 +7863,31 @@ skills["MoltenStrike"] = {
 			t_insert(breakdown.OverlapChance, s_format("^8=^7 %.2f^8%%", output.OverlapChance))
 		end
 
+		-- the returning damage penalty is conditional, so evaluate it with the condition set
+		local returnHitChance, returnMult = 0, 0
+		if skillModList:Flag(skillCfg, "ProjectilesReturn") then
+			local baseMult = skillModList:More(skillCfg, "Damage")
+			skillCfg.skillCond["ReturningProjectile"] = true
+			returnMult = skillModList:More(skillCfg, "Damage") / baseMult
+			skillCfg.skillCond["ReturningProjectile"] = nil
+			returnHitChance = skillModList:Sum("BASE", skillCfg, "ReturningBallHitChance") / 100
+		end
+		local hitChance = overlapChance + returnHitChance * returnMult
+		local hitChanceText, hitChanceValue = "overlap chance", s_format("^7%.3f", overlapChance)
+		if returnHitChance * returnMult > 0 then
+			hitChanceText = "(overlap chance + returning hit chance * returning damage multiplier)"
+			hitChanceValue = s_format("(^7%.3f ^8+ ^7%.2f ^8* ^7%.3f^8)", overlapChance, returnHitChance, returnMult)
+		end
+
 		local numProjectiles = output.ProjectileCount
 		local dpsMult = 1
 		if skillPart == 3 then
-			dpsMult = overlapChance * numProjectiles
+			dpsMult = hitChance * numProjectiles
 			if breakdown then
 				breakdown.SkillDPSMultiplier = {}
 				t_insert(breakdown.SkillDPSMultiplier, "DPS multiplier")
-				t_insert(breakdown.SkillDPSMultiplier, "^8= number of projectiles * overlap chance")
-				t_insert(breakdown.SkillDPSMultiplier, s_format("^8=^7 %d^8 *^7 %.3f^8", numProjectiles, overlapChance))
+				t_insert(breakdown.SkillDPSMultiplier, "^8= number of projectiles * " .. hitChanceText)
+				t_insert(breakdown.SkillDPSMultiplier, s_format("^8=^7 %d^8 * %s", numProjectiles, hitChanceValue))
 				t_insert(breakdown.SkillDPSMultiplier, s_format("^8=^7 %.3f", dpsMult))
 			end
 		end
@@ -8042,35 +8058,51 @@ skills["MoltenStrikeAltX"] = {
 			t_insert(breakdown.OverlapChance, s_format("^8=^7 %.2f^8%%", output.OverlapChance))
 		end
 
+		-- the returning damage penalty is conditional, so evaluate it with the condition set
+		local returnHitChance, returnMult = 0, 0
+		if skillModList:Flag(skillCfg, "ProjectilesReturn") then
+			local baseMult = skillModList:More(skillCfg, "Damage")
+			skillCfg.skillCond["ReturningProjectile"] = true
+			returnMult = skillModList:More(skillCfg, "Damage") / baseMult
+			skillCfg.skillCond["ReturningProjectile"] = nil
+			returnHitChance = skillModList:Sum("BASE", skillCfg, "ReturningBallHitChance") / 100
+		end
+		local hitChance = overlapChance + returnHitChance * returnMult
+		local hitChanceText, hitChanceValue = "overlap chance", s_format("^7%.3f", overlapChance)
+		if returnHitChance * returnMult > 0 then
+			hitChanceText = "(overlap chance + returning hit chance * returning damage multiplier)"
+			hitChanceValue = s_format("(^7%.3f ^8+ ^7%.2f ^8* ^7%.3f^8)", overlapChance, returnHitChance, returnMult)
+		end
+
 		local numProjectiles = output.ProjectileCount
 		local dpsMult = 1
 		if skillPart == 3 or skillPart == 5 or skillPart == 6 then
-			dpsMult = overlapChance * numProjectiles
+			dpsMult = hitChance * numProjectiles
 
 			if skillPart ~= 6 then
 				if breakdown then
 					breakdown.SkillDPSMultiplier = {}
 					t_insert(breakdown.SkillDPSMultiplier, "DPS multiplier")
-					t_insert(breakdown.SkillDPSMultiplier, "^8= number of projectiles * overlap chance")
-					t_insert(breakdown.SkillDPSMultiplier, s_format("^8=^7 %d^8 *^7 %.3f^8", numProjectiles, overlapChance))
+					t_insert(breakdown.SkillDPSMultiplier, "^8= number of projectiles * " .. hitChanceText)
+					t_insert(breakdown.SkillDPSMultiplier, s_format("^8=^7 %d^8 * %s", numProjectiles, hitChanceValue))
 					t_insert(breakdown.SkillDPSMultiplier, s_format("^8=^7 %.3f", dpsMult))
 				end
 			else
 				-- zenith: make an effective dpsMult for the weighted average of normal and 5th attack balls
 				local fifthAttackMulti = 1 + skillData.FifthStrikeDamage / 100
-				local fifthAttackOverallMulti = fifthAttackMulti * overlapChance * (numProjectiles + skillData.FifthStrikeProjectiles)
+				local fifthAttackOverallMulti = fifthAttackMulti * hitChance * (numProjectiles + skillData.FifthStrikeProjectiles)
 				dpsMult = 0.8 * dpsMult + 0.2 * fifthAttackOverallMulti
 
 				if breakdown then
 					breakdown.SkillDPSMultiplier = {}
 					t_insert(breakdown.SkillDPSMultiplier, "Weighted average DPS multiplier for balls")
 					t_insert(breakdown.SkillDPSMultiplier, "^8= (0.8 * balls dps) + (0.2 * 5th attack balls dps)")
-					t_insert(breakdown.SkillDPSMultiplier, s_format("^8= (0.8 * normal ball hit * overlap chance * number of projectiles) " ..
-						"+ (0.2 * ball hit * 5th attack multiplier * overlap chance * (number of projectiles + %d))", skillData.FifthStrikeProjectiles))
-					t_insert(breakdown.SkillDPSMultiplier, s_format("^8= ball hit * overlap chance * (0.8 * number of projectiles " ..
+					t_insert(breakdown.SkillDPSMultiplier, "^8= (0.8 * normal ball hit * " .. hitChanceText .. " * number of projectiles) " ..
+						s_format("+ (0.2 * ball hit * 5th attack multiplier * %s * (number of projectiles + %d))", hitChanceText, skillData.FifthStrikeProjectiles))
+					t_insert(breakdown.SkillDPSMultiplier, "^8= ball hit * " .. hitChanceText .. s_format(" * (0.8 * number of projectiles " ..
 						"+ 0.2 * 5th attack multiplier * (number of projectiles + %d))", skillData.FifthStrikeProjectiles))
-					t_insert(breakdown.SkillDPSMultiplier, s_format("^8= ball hit * ^7%.3f ^8* (0.8 * ^7%d ^8+ 0.2 * ^7%.1f ^8* ^7%d^8)",
-						overlapChance, numProjectiles, fifthAttackMulti, numProjectiles + skillData.FifthStrikeProjectiles))
+					t_insert(breakdown.SkillDPSMultiplier, s_format("^8= ball hit * %s ^8* (0.8 * ^7%d ^8+ 0.2 * ^7%.1f ^8* ^7%d^8)",
+						hitChanceValue, numProjectiles, fifthAttackMulti, numProjectiles + skillData.FifthStrikeProjectiles))
 					t_insert(breakdown.SkillDPSMultiplier, s_format("^8= ball hit * ^7 %.3f", dpsMult))
 				end
 			end
