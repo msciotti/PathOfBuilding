@@ -14,7 +14,12 @@ Personal patch on PathOfBuildingCommunity/PathOfBuilding v2.68.1 (PoE1). Goal: l
 - `src/AgentBridge.lua` — loopback line-delimited JSON-RPC on 127.0.0.1:49090, polled from `launch:OnFrame`. Hot-reloadable (`reload`).
 - `src/Launch.lua` — +6 lines: load bridge on init, poll each frame.
 - `src/Classes/AgentTab.lua` + `src/Modules/Build.lua` (+9 lines) — in-app **Agent** chat: the "Agent >>" button (next to Compare) toggles a panel docked on the right of whatever tab is open. `ProcessInput` runs before the tab (takes clicks/scroll over the panel, releases focus on outside clicks); `Draw` runs after it on draw sublayer 50 so tree art does not bleed over.
-- `agent/mcp/server.mjs` — MCP stdio server proxying to the bridge (`npm install` in `agent/mcp`; env POB_AGENT_PORT). Registered for Claude Code in `/.mcp.json`.
+- `agent/mcp/tools.mjs` — bridge client + tool definitions, shared by:
+  - `agent/mcp/server.mjs` — MCP stdio server proxying to the bridge (`npm install` in `agent/mcp`; env POB_AGENT_PORT). Registered for Claude Code in `/.mcp.json`.
+  - `agent/mcp/agent.mjs` — standalone chat agent on the Claude API (no Claude Code needed): loops `chat_wait` -> model + pob_* tools -> `chat_reply`.
+    Streams with adaptive thinking, `display: "updates"` (progress notes become `chat_status` steps), server-side tool-result clearing, prompt
+    caching and refusal fallbacks. Keeps one conversation; resets when the panel's Clear empties the transcript. Env: ANTHROPIC_API_KEY,
+    POB_AGENT_MODEL (default claude-opus-5-5), POB_AGENT_EFFORT (default high).
 - `agent/tools/` — `rpc.py` (tiny client), `ui.sh` (Xvfb/xdotool screenshot+click driver, Wine), `load_build.sh` (imports a character through the real Import tab), `probe_all.py`, `headless_test.lua`.
 
 ## Bridge methods
@@ -25,7 +30,7 @@ chat_wait{timeout}, chat_reply{text}, chat_status{text}, chat_history`.
 - Chat (option 1: PoB is only the UI, any external agent connects): the Agent tab queues user messages in `launch.agentChat` (survives `reload`).
   `chat_wait` is *deferred* — the bridge holds the connection open (handler returns `{_defer=fn}`, polled each frame) until a message arrives or the
   timeout (default 50s) passes. Agent loop: `chat_wait -> pob_* tools -> chat_reply -> chat_wait`. Tab shows "listening" while a wait is pending,
-  "working" for 2 min after the last chat call. Possible later: option 2, PoB calling the Claude API itself.
+  "working" for 2 min after the last chat call. `agent/mcp/agent.mjs` is a ready-made agent for this loop.
 - `what_if` adds a temporary Config custom-mod block (`configSets[active].customModsList`), recalcs, diffs `calcsTab.mainOutput`, removes the block.
   Requirements come from the parsed mod tags (`requirements()`), each with `metOnBuild`; when any isn't met, `ifConditionsMet` recalcs with
   them forced: Condition -> `Condition:X` flag; "not X" -> config mods named `Condition:X` removed; MultiplierThreshold -> base multiplier;
@@ -76,8 +81,8 @@ Each case uses a real game-data line found by search and checks the stat moves (
 
 ## Run it
 Windows/Mac/Linux: run PoB from this tree (`runtime/Path{space}of{space}Building.exe` on Windows), build loaded, then `python3 agent/tools/rpc.py ping`.
-Chat: `cd agent/mcp && npm install`, start Claude Code in the repo root (approve the `pob-agent` server), ask it to "watch the PoB chat",
-then type in PoB's Agent tab.
+Chat with an API key: `cd agent/mcp && npm install`, put `ANTHROPIC_API_KEY=sk-ant-...` in `agent/mcp/.env` (gitignored), `npm run agent`,
+then type in PoB's Agent tab. Or with Claude Code: start it in the repo root (approve the `pob-agent` server) and ask it to "watch the PoB chat".
 Linux headless (what I used): `wine`, Xvfb :99, `agent/tools/ui.sh start`, `load_build.sh` (hardcoded account/click coordinates for 1440x900).
 
 - `reload` swaps RPC handlers only; `restart` (= F5, dev mode) reloads all Lua in-process (~3s, unsaved build changes lost). Use it after editing `poll`/`start` or any app code.
