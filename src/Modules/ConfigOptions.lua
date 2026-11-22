@@ -1586,6 +1586,10 @@ Huge sets the radius to 11.
 	{ var = "conditionSacrificeMinion", type = "check", label = "Sacrifice Minion on Attack", ifCond = "SacrificeMinionOnAttack", ifFlag = "Condition:HaveDamageableMinion", defaultState = true, tooltip = "Each Attack is sacrificing a damage minion to grant you extra projectiles.", apply = function(val, modList, enemyModList)
 		modList:NewMod("Condition:SacrificeMinionOnAttack", "FLAG", true, "Config", { type = "Condition", var = "Combat" })
 	end },
+	{ var = "conditionUsedRetaliationRecently", type = "check", label = "Have you used a Retaliation Skill?", ifCond = "UsedRetaliationRecently", implyCond = "UsedSkillRecently", tooltip = "Have you used a Retaliation Skill Recently?\nThis also implies that you have used a Skill Recently.", apply = function(val, modList, enemyModList)
+		modList:NewMod("Condition:UsedRetaliationRecently", "FLAG", true, "Config", { type = "Condition", var = "Combat" })
+		modList:NewMod("Condition:UsedSkillRecently", "FLAG", true, "Config", { type = "Condition", var = "Combat" })
+	end },
 	{ var = "conditionUsedWarcryRecently", type = "check", label = "Have you used a Warcry Recently?", {ifFlag = "warcry", ifCond = "UsedWarcryRecently"}, implyCondList = {"UsedWarcryInPast8Seconds", "UsedSkillRecently"}, tooltip = "This also implies that you have used a Skill Recently.", apply = function(val, modList, enemyModList)
 		modList:NewMod("Condition:UsedWarcryRecently", "FLAG", true, "Config", { type = "Condition", var = "Combat" })
 		modList:NewMod("Condition:UsedWarcryInPast8Seconds", "FLAG", true, "Config", { type = "Condition", var = "Combat" })

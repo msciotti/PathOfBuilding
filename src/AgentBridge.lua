@@ -719,7 +719,7 @@ function methods.rank_options(p)
 		return changed, score
 	end
 	local baselines, fromAssumptionsAlone = {}, {}
-	local function baselineFor(names, assume)
+	local function baselineFor(names, assume, via)
 		local key = table.concat(names, "|")
 		if baselines[key] == nil then
 			local ok, snap = assumedBaseline(b, assume)
@@ -727,7 +727,7 @@ function methods.rank_options(p)
 			if ok and next(goal) then
 				local _, s0 = measure(snap)
 				if s0 > 0 then
-					fromAssumptionsAlone[#fromAssumptionsAlone + 1] = { assumed = names, score = s0 }
+					fromAssumptionsAlone[#fromAssumptionsAlone + 1] = { assumed = names, score = s0, via = via }
 				end
 			end
 		end
@@ -744,8 +744,23 @@ function methods.rank_options(p)
 		if e.group and (e.level or 0) < (bestLvl[e.src .. "|" .. e.group] or 0) and (p.roll or "max") == "max" then
 			skipped = skipped + 1
 		elseif status and status.allocated and e.src:find("^passive:") then
-			-- Already on the tree: adding it again would double-count it
+			-- Already on the tree: adding it again would double-count it. Its conditions still matter: an allocated
+			-- node waiting on a Config toggle (e.g. "if you've used a Retaliation Skill Recently") shows in alreadyOnBuildIf
 			allocatedSkipped[#allocatedSkipped + 1] = e.name or e.id
+			if p.assume ~= false then
+				local assume, names, seenName = {}, {}, {}
+				for _, l in ipairs(e.lines) do
+					for _, m in ipairs(parseLine(resolveRanges(l, p.roll or "max"))._assume) do
+						local name = assumedNames({ m })[1]
+						if not seenName[name] then
+							seenName[name] = true
+							assume[#assume + 1] = m
+							names[#names + 1] = name
+						end
+					end
+				end
+				if #assume > 0 then baselineFor(names, assume, e.name) end
+			end
 		else
 			-- Uniques carry every variant's lines; score only the lines that match the query
 			local lines = e.lines
