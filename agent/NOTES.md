@@ -18,8 +18,8 @@ Personal patch on PathOfBuildingCommunity/PathOfBuilding v2.68.1 (PoE1). Goal: l
 - `agent/tools/` — `rpc.py` (tiny client), `ui.sh` (Xvfb/xdotool screenshot+click driver, Wine), `load_build.sh` (imports a character through the real Import tab), `probe_all.py`, `headless_test.lua`.
 
 ## Bridge methods
-`ping, reload, restart, list_sources, search{query,sources,slot,limit,exact}, inspect{path,depth,maxKeys}, get_state,
-what_if{mods,stats,roll,assume,slot}, rank_options{query,goal,roll,max,top,stats,assume}, parse_mod{lines,roll}, list_stats{query},
+`ping, reload, restart, list_sources, search{query,sources,slot,limit,exact,includeLegacy}, inspect{path,depth,maxKeys}, get_state,
+what_if{mods,stats,roll,assume,slot}, rank_options{query,goal,roll,max,top,stats,assume,includeLegacy}, path_cost{nodes}, parse_mod{lines,roll}, list_stats{query},
 probe_batch{budget,reset}, find_by_effect{stat,direction,conditional,...}, effect_stats,
 chat_wait{timeout}, chat_reply{text}, chat_status{text}, chat_history`.
 - Chat (option 1: PoB is only the UI, any external agent connects): the Agent tab queues user messages in `launch.agentChat` (survives `reload`).
@@ -37,6 +37,15 @@ chat_wait{timeout}, chat_reply{text}, chat_status{text}, chat_history`.
 - `rank_options` = search -> what-if each hit -> rank by weighted (after-before)/max(|before|,|after|) (bounded, works when before=0).
   Conditional rows are re-scored with conditions forced (`assumed`); rows show `requires` and `unsupported` lines; zero-score rows are dropped
   (`noEffect`). Uniques score only their query-matching lines. Lower tiers of the same mod group are skipped at roll=max.
+  Conditional rows are measured against the build with the same assumptions applied (so switching on an equipped flask isn't credited
+  to the tested mod); assumptions that reach the goal by themselves are listed in `alreadyOnBuildIf`, and identical text from other
+  sources in `alsoFrom`. Passives/mastery effects already allocated are skipped (`alreadyAllocated`); passive rows carry `pathDist`.
+- Index labels: explicit/corrupted mods with zero spawn weight carry `obtain` (essence only, Maven's Orb for Elevated, special source);
+  ones whose item tags all weigh 0 are `legacy` and hidden unless `includeLegacy`. Cluster jewels are `cluster:enchant` (small passive
+  stats) and `cluster:notable`/`cluster:keystone` (`spawnOn` = enchants they roll with, mapped by enchant tag). Derived stats
+  `<Ailment>ImmuneEffective` cover both "Cannot be X" and "Unaffected by X".
+- `path_cost{nodes}` = points to allocate several nodes together (ids or names), 0-1 BFS with PoB's pathing rules, greedy over targets.
+- `what_if` `ifConditionsMet.alreadyFromAssumptions`: the assumptions alone already give the effect (e.g. a flask the build has).
 - `parse_mod` shows PoB's parsed mods incl. tags and decoded `flags`/`keywordFlags` (Hit, Dot, Attack...), `supported`, `requires`.
 - `get_state` includes `mainSkill` {name, skill types} and a `dpsHint` (use CombinedDPS; FullDPS needs skills in Full DPS).
 - `probe_batch`/`find_by_effect` = **effect index** (the "go in reverse" idea): probe each distinct normalised mod line once, cache which output stats it moves

@@ -114,15 +114,21 @@ end
 
 local function entryOut(e)
 	return { src = e.src, id = e.id, name = e.name, kind = e.kind, level = e.level, group = e.group,
-		lines = e.lines, tags = e.tags, spawnOn = e.spawnOn, ascendancy = e.ascendancy, essenceSlots = e.essenceSlots }
+		lines = e.lines, tags = e.tags, spawnOn = e.spawnOn, ascendancy = e.ascendancy, essenceSlots = e.essenceSlots,
+		obtain = e.obtain, legacy = e.legacy }
 end
+
+local passiveStatus
 
 function methods.search(p)
 	local res, total, by, terms = AgentData.search(getIndex(), p.query or "", {
-		sources = p.sources, slot = p.slot, limit = p.limit or 50, exact = p.exact })
+		sources = p.sources, slot = p.slot, limit = p.limit or 50, exact = p.exact, includeLegacy = p.includeLegacy })
+	local b = env().build
 	local out = {}
 	for i, e in ipairs(res) do
 		out[i] = entryOut(e)
+		local status = b and (e.src:find("^passive:") or e.src:find("^cluster:")) and passiveStatus(b, e)
+		if status then out[i].allocated, out[i].pathDist = status.allocated, status.pathDist end
 		if #e.lines > 3 then out[i].matched = AgentData.matchedLines(e, terms) end
 	end
 	local note
@@ -553,6 +559,12 @@ function methods.what_if(p)
 		if ok3 and okB then
 			met = { assumed = assumedNames(assume), cannotForce = #unmet > 0 and unmet or nil, changed = diffStats(baseMet, afterMet, want),
 				note = "before = the build with the assumptions applied but without these mods" }
+			-- The assumptions alone can already give the effect (e.g. an equipped flask with the same immunity)
+			local fromAssume = diffStats(base, baseMet, want)
+			if next(met.changed) == nil and next(fromAssume) ~= nil then
+				met.alreadyFromAssumptions = fromAssume
+				met.note = met.note .. "; the assumptions by themselves already change alreadyFromAssumptions (e.g. an equipped flask that has this effect)"
+			end
 		end
 	end
 	local ok2 = pcall(recalc, b)
@@ -615,6 +627,103 @@ function methods.what_if(p)
 		ifConditionsMet = met, modTotals = totals, socketedAppliedTo = #socketedInfo > 0 and socketedInfo or nil, changedOther = changedOther, capped = #capped > 0 and capped or nil, unsupported = #unsupported > 0 and unsupported or nil, restored = ok2, note = note }
 end
 
+-- Where a passive-tree entry stands on the build: allocated already, and the points to reach it otherwise.
+-- Mastery entries are effect ids: taken if any mastery node has that effect selected, else the nearest
+-- unallocated mastery node offering it. Cluster notables count as allocated when a socketed cluster has one.
+function passiveStatus(b, e)
+	local spec = b.spec
+	if e.src == "passive:mastery" then
+		local effect = tonumber(e.id)
+		for _, sel in pairs(spec.masterySelections or {}) do
+			if sel == effect then return { allocated = true } end
+		end
+		local best
+		for _, node in pairs(spec.nodes) do
+			if not node.alloc and node.type == "Mastery" and node.pathDist and node.pathDist < 1000 then
+				for _, fx in ipairs(node.masteryEffects or {}) do
+					if fx.effect == effect and (not best or node.pathDist < best) then best = node.pathDist end
+				end
+			end
+		end
+		return { allocated = false, pathDist = best }
+	elseif e.src:find("^passive:") then
+		local node = spec.nodes[tonumber(e.id)]
+		if not node then return nil end
+		return { allocated = node.alloc and true or false, pathDist = not node.alloc and node.pathDist < 1000 and node.pathDist or nil }
+	elseif e.src == "cluster:notable" or e.src == "cluster:keystone" then
+		for _, node in pairs(spec.allocNodes) do
+			if node.dn == e.name then return { allocated = true } end
+		end
+		return { allocated = false }
+	end
+end
+
+-- Points to allocate a set of passive nodes together from the current tree, with PoB's pathing rules (no
+-- passing through class starts, across ascendancies, or out of masteries). Greedy: repeatedly takes the
+-- target closest to everything allocated so far, so shared path segments are paid for once.
+-- params: { nodes = { id or name, ... } }; a name matches every tree node with that name (nearest one wins)
+function methods.path_cost(p)
+	local b = env().build
+	if not b then return { error = "no build loaded" } end
+	local spec = b.spec
+	local targets, unknown = {}, {}
+	for _, want in ipairs(p.nodes or {}) do
+		local group = {}
+		local id = tonumber(want)
+		if id and spec.nodes[id] then
+			group[1] = spec.nodes[id]
+		else
+			for _, node in pairs(spec.nodes) do
+				if node.dn and node.dn:lower() == tostring(want):lower() then group[#group + 1] = node end
+			end
+		end
+		if #group == 0 then unknown[#unknown + 1] = want else targets[#targets + 1] = { want = want, nodes = group } end
+	end
+	local taken = {}
+	for id, node in pairs(spec.allocNodes) do taken[node] = true end
+	local total, steps = 0, {}
+	while #targets > 0 do
+		-- 0-1 BFS from everything allocated or already bought
+		local dist, parent, queue, qs = {}, {}, {}, 1
+		for node in pairs(taken) do dist[node] = 0 queue[#queue + 1] = node end
+		while qs <= #queue do
+			local node = queue[qs]
+			qs = qs + 1
+			for _, other in ipairs(node.linked or {}) do
+				local w = taken[other] and 0 or 1
+				local d = dist[node] + w
+				local canTraverse = node.type ~= "Mastery" and other.type ~= "ClassStart" and other.type ~= "AscendClassStart"
+					and (node.ascendancyName == other.ascendancyName or (dist[node] == 0 and not other.ascendancyName))
+				if canTraverse and d < (dist[other] or math.huge) then
+					dist[other], parent[other] = d, node
+					if w == 0 then qs = qs - 1 queue[qs] = other else queue[#queue + 1] = other end
+				end
+			end
+		end
+		local bestT, bestNode, bestI
+		for i, t in ipairs(targets) do
+			for _, node in ipairs(t.nodes) do
+				if dist[node] and (not bestNode or dist[node] < dist[bestNode]) then bestT, bestNode, bestI = t, node, i end
+			end
+		end
+		if not bestNode then
+			for _, t in ipairs(targets) do unknown[#unknown + 1] = tostring(t.want) .. " (unreachable)" end
+			break
+		end
+		local path, node = {}, bestNode
+		while node and not taken[node] do
+			table.insert(path, 1, node.dn or tostring(node.id))
+			taken[node] = true
+			node = parent[node]
+		end
+		total = total + #path
+		steps[#steps + 1] = { target = bestT.want, id = bestNode.id, points = #path, path = path }
+		table.remove(targets, bestI)
+	end
+	return { points = total, steps = steps, notFound = #unknown > 0 and unknown or nil,
+		note = "Greedy over the targets: an exact optimum can occasionally be a point or two lower. Cluster jewel nodes only count if their jewel is socketed." }
+end
+
 -- Evaluate every search hit as a what-if, rank by a goal.
 -- params: search params + { goal = "TotalDPS" | {Life=1,TotalDPS=0.5}, roll = "max"|"mid"|"min",
 --   max = 500, budget = 120 (seconds), top = 25, stats = {extra stats to show} }
@@ -623,7 +732,7 @@ function methods.rank_options(p)
 	local b = env().build
 	if not b then return { error = "no build loaded" } end
 	local res, total, _, terms = AgentData.search(getIndex(), p.query or "", {
-		sources = p.sources, slot = p.slot, limit = 100000, exact = p.exact })
+		sources = p.sources, slot = p.slot, limit = 100000, exact = p.exact, includeLegacy = p.includeLegacy })
 	local goal = {}
 	if type(p.goal) == "string" then goal[p.goal] = 1
 	elseif type(p.goal) == "table" then for k, w in pairs(p.goal) do goal[k] = w end end
@@ -670,15 +779,19 @@ function methods.rank_options(p)
 		end
 		return baselines[key] or nil
 	end
-	local seen, rows, skipped = {}, {}, 0
+	local seen, rows, skipped, allocatedSkipped = {}, {}, 0, {}
 	local t0, budget, cap = os.clock(), p.budget or 120, p.max or 500
 	local evaluated, timedOut = 0, false
 	for _, e in ipairs(res) do
 		if evaluated >= cap then break end
 		if os.clock() - t0 > budget then timedOut = true break end
 		local mods, partial = {}, nil
+		local status = (e.src:find("^passive:") or e.src:find("^cluster:")) and passiveStatus(b, e) or nil
 		if e.group and (e.level or 0) < (bestLvl[e.src .. "|" .. e.group] or 0) and (p.roll or "max") == "max" then
 			skipped = skipped + 1
+		elseif status and status.allocated and e.src:find("^passive:") then
+			-- Already on the tree: adding it again would double-count it
+			allocatedSkipped[#allocatedSkipped + 1] = e.name or e.id
 		else
 			-- Uniques carry every variant's lines; score only the lines that match the query
 			local lines = e.lines
@@ -742,7 +855,8 @@ function methods.rank_options(p)
 				end
 				rows[#rows + 1] = { src = e.src, name = e.name or e.id, id = e.id, mods = mods, matchedLinesOnly = partial, unsupported = unsupported, requires = requires,
 					spawnOn = e.spawnOn, score = score, statsChanged = changed, stats = deltas, assumed = assumed,
-					alsoFrom = seen[text] }
+					alsoFrom = seen[text], obtain = e.obtain, pathDist = status and status.pathDist,
+					alreadyOnBuild = status and status.allocated or nil }
 			end
 		end
 	end
@@ -762,7 +876,10 @@ function methods.rank_options(p)
 	return { candidates = total, evaluated = evaluated, duplicatesSkipped = skipped, timedOut = timedOut, noEffect = noEffect,
 		seconds = os.clock() - t0, roll = p.roll or "max", ranked = top,
 		alreadyOnBuildIf = #fromAssumptionsAlone > 0 and fromAssumptionsAlone or nil,
-		note = "Rows with `assumed` only score that way once those conditions hold (flask active, aura on, threshold reached...)." }
+		alreadyAllocated = #allocatedSkipped > 0 and allocatedSkipped or nil,
+		note = "Rows with `assumed` only score that way once those conditions hold (flask active, aura on, threshold reached...). "
+			.. "Passive rows carry pathDist (points from the current tree); use path_cost for several nodes together. "
+			.. "Passives already allocated are left out (alreadyAllocated); legacy mods that no longer roll are left out unless includeLegacy." }
 end
 
 -- Index key: the line at its max roll. Exact text, not the number-stripped shape, so "100% chance to Avoid being
@@ -867,8 +984,8 @@ function methods.find_by_effect(p)
 	local hits, total = {}, 0
 	local dir = p.direction or "up"
 	for _, e in ipairs(getIndex().list) do
-		local ok = true
-		if p.sources then
+		local ok = p.includeLegacy or not e.legacy
+		if ok and p.sources then
 			ok = false
 			for _, pre in ipairs(p.sources) do if e.src:sub(1, #pre) == pre then ok = true break end end
 		end
@@ -899,7 +1016,7 @@ function methods.find_by_effect(p)
 				total = total + 1
 				hits[#hits + 1] = { src = e.src, name = e.name or e.id, delta = best, line = via, requires = req,
 					requirementsMetOnBuild = req and metNow or nil,
-					spawnOn = e.spawnOn, allLines = e.lines, level = e.level, group = e.group }
+					spawnOn = e.spawnOn, allLines = e.lines, level = e.level, group = e.group, obtain = e.obtain }
 			end
 		end
 	end

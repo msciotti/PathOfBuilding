@@ -53,6 +53,10 @@ def check_line(line, stat, conditional):
         return True, f"{stat} {met_changed['before']}->{met_changed['after']} if {', '.join(met['assumed'])}"
     if current is not None and current >= target:
         return True, f"{stat} already {current} on this build"
+    # The assumptions alone already give it (e.g. an equipped flask with the same immunity): reported, not credited
+    already = ((met or {}).get("alreadyFromAssumptions") or {}).get(stat)
+    if already and already["after"] >= target:
+        return True, f"{stat} already {already['after']} if {', '.join(met['assumed'])} (from the build's own gear)"
     return False, f"{stat} not reaching {target}: changed={changed} met={met} requires={w.get('requires')} note={w.get('note')}"
 
 def main():
