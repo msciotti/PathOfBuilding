@@ -709,11 +709,14 @@ function methods.rank_options(p)
 		note = "Rows with `assumed` only score that way once those conditions hold (flask active, aura on, threshold reached...)." }
 end
 
+-- Index key: the line at its max roll. Exact text, not the number-stripped shape, so "100% chance to Avoid being
+-- Frozen" and "(21-25)% chance to Avoid being Frozen" each get their own probed delta.
 local function normLine(l)
-	return (l:gsub("%(%-?[%d%.]+%-%-?[%d%.]+%)", "#"):gsub("%-?%d+%.?%d*", "#"))
+	return (resolveRanges(l, "max"):gsub("%s+", " "):match("^%s*(.-)%s*$"))
 end
 
 local CACHE = "agent_effects.json"
+local EFFECTS_VERSION = 2 -- bump when the key or probe logic changes; older caches are discarded
 local effects, queue, qpos  -- effects[normLine] = { text=probedText, d={stat=delta}, n=changedCount }
 
 local function loadEffects()
@@ -723,12 +726,13 @@ local function loadEffects()
 	if f then
 		local ok, t = pcall(json.decode, f:read("*a"))
 		f:close()
-		if ok and type(t) == "table" then effects = t end
+		if ok and type(t) == "table" and t._version == EFFECTS_VERSION then effects = t end
 	end
 end
 
 local function saveEffects()
 	local f = io.open(CACHE, "w")
+	effects._version = EFFECTS_VERSION
 	if f then f:write(json.encode(effects)) f:close() end
 end
 
@@ -736,12 +740,12 @@ local function buildQueue()
 	queue, qpos = {}, 1
 	local seen = {}
 	for _, e in ipairs(getIndex().list) do
-		if not e.src:find("^gem") and not e.src:find("^enchant") then
+		if not e.src:find("^gem") then
 			for _, l in ipairs(e.lines) do
 				local k = normLine(l)
 				if not seen[k] and not effects[k] and #l > 3 then
 					seen[k] = true
-					queue[#queue + 1] = { k = k, text = resolveRanges(l, "max") }
+					queue[#queue + 1] = { k = k, text = k }
 				end
 			end
 		end
@@ -753,7 +757,7 @@ function methods.probe_batch(p)
 	local b = env().build
 	if not b then return { error = "no build loaded" } end
 	loadEffects()
-	if p.reset then effects = {} queue = nil end
+	if p.reset then effects = { _version = EFFECTS_VERSION } queue = nil end
 	if not queue then buildQueue() end
 	local base = snapshot(b.calcsTab.mainOutput)
 	local function deltas(after)
@@ -858,6 +862,7 @@ function methods.effect_stats(p)
 	local c, noeff, errs, unsupported, conditional = 0, 0, 0, 0, 0
 	local statCounts = {}
 	for k, v in pairs(effects) do
+		if type(v) ~= "table" then goto continue end
 		c = c + 1
 		if v.unsupported then unsupported = unsupported + 1
 		elseif v.n == 0 and (v.nm or 0) == 0 then noeff = noeff + 1 end
@@ -867,6 +872,7 @@ function methods.effect_stats(p)
 		for s in pairs(v.d or {}) do moved[s] = true end
 		for s in pairs(v.dm or {}) do moved[s] = true end
 		for s in pairs(moved) do statCounts[s] = (statCounts[s] or 0) + 1 end
+		::continue::
 	end
 	return { probed = c, unsupportedByParser = unsupported, conditional = conditional, noEffect = noeff, errors = errs,
 		statsMoved = statCounts }
@@ -911,7 +917,8 @@ function methods.chat_wait(p)
 		c.lastSeen = GetTime()
 		c.delivered = #c.messages
 		if #msgs == 0 then return { messages = {}, timedOut = true, hint = "No message yet; call chat_wait again." } end
-		c.status = "Thinking..."
+		-- The agent is now working: the panel shows a live "Agent" entry whose steps come from chat_status
+		c.thinking = { steps = {}, since = GetTime() }
 		return { messages = msgs, build = buildName(), hint = "Answer with chat_reply (use chat_status for progress), then call chat_wait again." }
 	end }
 end
@@ -921,17 +928,23 @@ function methods.chat_reply(p)
 	local c = chat()
 	if type(p.text) ~= "string" or p.text == "" then return { error = "text required" } end
 	c.lastSeen = GetTime()
-	c.messages[#c.messages + 1] = { role = "agent", text = p.text, time = os.time() }
+	-- revealAt lets the panel type the reply out; thoughts keeps the progress steps above it
+	c.messages[#c.messages + 1] = { role = "agent", text = p.text, time = os.time(), revealAt = GetTime(),
+		thoughts = c.thinking and #c.thinking.steps > 0 and c.thinking.steps or nil }
 	c.delivered = #c.messages
-	c.status = nil
+	c.thinking = nil
 	return { ok = true }
 end
 
--- params: { text = "..." }. Short progress line under the transcript, e.g. "Ranking boot mods...". Empty clears it.
+-- params: { text = "..." }. A progress step shown live in the transcript under the pending Agent entry, e.g.
+-- "Ranking boot mods...". Each new text adds a step; the steps stay above the reply once it arrives.
 function methods.chat_status(p)
 	local c = chat()
 	c.lastSeen = GetTime()
-	c.status = (type(p.text) == "string" and p.text ~= "") and p.text or nil
+	if type(p.text) ~= "string" or not p.text:match("%S") then return { ok = true } end
+	c.thinking = c.thinking or { steps = {}, since = GetTime() }
+	local steps = c.thinking.steps
+	if steps[#steps] ~= p.text then steps[#steps + 1] = p.text end
 	return { ok = true }
 end
 
