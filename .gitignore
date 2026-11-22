@@ -48,3 +48,5 @@ runtime/SimpleGraphic/Screenshots
 agent_effects.json
 node_modules/
 __pycache__/
+
+agent/mcp/.env
