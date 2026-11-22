@@ -177,6 +177,51 @@ local function snapshot(out)
 	return addDerived(out, t)
 end
 
+-- Skills whose parts all happen on one use and so add up (skill name -> part indices). Other multi-part skills have
+-- alternative parts (one projectile vs all, trap placement...) and report the selected part only.
+local COMBINED_PARTS = {
+	["Molten Strike"] = { 1, 3 }, -- melee hit + average balls hitting (part 2 is a single ball, an alternative to 3)
+	["Molten Strike of the Zenith"] = { 1, 6 }, -- melee hit + weighted average of normal and 5th-attack balls
+}
+
+-- CombinedDPS of the main skill summed over its COMBINED_PARTS, for the build as last calculated. The selected
+-- part comes from mainOutput; each other part costs one calculation with the part switched, then restored.
+local function skillTotal(b)
+	local calcs_ = b.calcsTab.calcs
+	local out = b.calcsTab.mainOutput
+	local skill = b.calcsTab.mainEnv.player.mainSkill
+	local effect = skill and skill.activeEffect
+	local parts = effect and effect.srcInstance and COMBINED_PARTS[effect.grantedEffect.name]
+	if not parts then return out.CombinedDPS or 0 end
+	local src = effect.srcInstance
+	local selected = src.skillPart
+	local total, components = 0, {}
+	for _, part in ipairs(parts) do
+		local dps = out.CombinedDPS or 0
+		if part ~= selected then
+			src.skillPart = part
+			local ok, res = pcall(function()
+				local env_ = calcs_.initEnv(b, "CALCULATOR")
+				calcs_.perform(env_)
+				return env_.player.output.CombinedDPS or 0
+			end)
+			src.skillPart = selected
+			if not ok then error(res, 0) end
+			dps = res
+		end
+		total = total + dps
+		components[#components + 1] = { part = part, name = effect.grantedEffect.parts[part].name, dps = dps }
+	end
+	return total, components
+end
+
+local function currentStats(b)
+	local t = snapshot(b.calcsTab.mainOutput)
+	local total, components = skillTotal(b)
+	t.SkillTotalDPS = total
+	return t, components
+end
+
 local function mainSkillInfo(b)
 	local env_ = b.calcsTab and b.calcsTab.mainEnv
 	local skill = env_ and env_.player and env_.player.mainSkill
@@ -197,11 +242,13 @@ end
 function methods.get_state()
 	local b = env().build
 	if not b then return { error = "no build loaded" } end
+	local stats, components = currentStats(b)
 	return {
 		class = b.spec and b.spec.curClassName, ascendancy = b.spec and b.spec.curAscendClassName,
 		level = b.characterLevel, mainSkill = mainSkillInfo(b),
-		dpsHint = "Use CombinedDPS (or TotalDPS for hits only) as a DPS goal. FullDPS is only set when skills are marked for Full DPS; PoisonDPS/BleedDPS are per stack, so use WithPoisonDPS/WithBleedDPS or CombinedDPS.",
-		stats = snapshot(b.calcsTab and b.calcsTab.mainOutput or {}),
+		dpsHint = "Use SkillTotalDPS as the DPS goal: it adds up the parts of a multi-part skill that happen on one use (Molten Strike) and equals CombinedDPS otherwise. CombinedDPS is only the selected skill part; TotalDPS is hits only. FullDPS is only set when skills are marked for Full DPS; PoisonDPS/BleedDPS are per stack, so use WithPoisonDPS/WithBleedDPS or CombinedDPS.",
+		skillTotal = { combined = components ~= nil, components = components },
+		stats = stats,
 	}
 end
 
@@ -214,7 +261,7 @@ function methods.list_stats(p)
 	end
 	local q = p.query and p.query:lower()
 	local out = {}
-	for k, v in pairs(snapshot(b.calcsTab.mainOutput)) do
+	for k, v in pairs((currentStats(b))) do
 		if not q or k:lower():find(q, 1, true) or (labels[k] or ""):lower():find(q, 1, true) then
 			out[#out + 1] = { stat = k, label = labels[k], value = v }
 		end
@@ -407,7 +454,12 @@ local function evalMods(b, lines, extra, totalsFor)
 	list[#list + 1] = block
 	local ok, after, totals = pcall(recalc, b, extra, totalsFor)
 	for i = #list, 1, -1 do if list[i] == block then table.remove(list, i) end end
-	return ok, after, totals
+	local components
+	if ok then
+		local okT, total, comps = pcall(skillTotal, b)
+		if okT then after.SkillTotalDPS, components = total, comps else ok, after = false, total end
+	end
+	return ok, after, totals, components
 end
 
 local function mainSkill(b)
@@ -457,7 +509,7 @@ end
 function methods.what_if(p)
 	local b = env().build
 	if not b then return { error = "no build loaded" } end
-	local base = snapshot(b.calcsTab.mainOutput)
+	local base, baseComponents = currentStats(b)
 	local lines, unsupported, reqs, assume, unmet, seen, names = {}, {}, {}, {}, {}, {}, {}
 	local alreadyKeystone, socketedMods, socketedInfo, flagMismatch, hitOnly = {}, {}, {}, {}, {}
 	for _, l in ipairs(p.mods or {}) do
@@ -513,7 +565,7 @@ function methods.what_if(p)
 
 	local totalsBefore = modTotals(b, names)
 	local flagsBefore = copyTable((mainSkill(b) or {}).skillFlags or {}, true)
-	local ok, after, totalsAfter = evalMods(b, lines, socketedMods, names)
+	local ok, after, totalsAfter, afterComponents = evalMods(b, lines, socketedMods, names)
 	for _, m in ipairs(socketedMods) do table.insert(assume, 1, m) end
 	if ok then
 		local flagsAfter = (mainSkill(b) or {}).skillFlags or {}
@@ -603,7 +655,14 @@ function methods.what_if(p)
 			note = "Parsed but no output stat changed: the build may already have this effect (check `current` via stats) or it isn't shown in calc output."
 		end
 	end
-	return { applied = lines, changed = diff, current = current, requires = #reqs > 0 and reqs or nil,
+	local totalParts
+	if baseComponents and afterComponents then
+		totalParts = { combined = true, components = {} }
+		for i, c in ipairs(baseComponents) do
+			totalParts.components[i] = { part = c.part, name = c.name, before = c.dps, after = afterComponents[i].dps }
+		end
+	end
+	return { applied = lines, changed = diff, skillTotal = totalParts, current = current, requires = #reqs > 0 and reqs or nil,
 		ifConditionsMet = met, modTotals = totals, socketedAppliedTo = #socketedInfo > 0 and socketedInfo or nil, changedOther = changedOther, capped = #capped > 0 and capped or nil, unsupported = #unsupported > 0 and unsupported or nil, restored = ok2, note = note }
 end
 
@@ -708,7 +767,7 @@ function methods.rank_options(p)
 	for k in pairs(goal) do show[#show + 1] = k end
 	for _, k in ipairs(p.stats or {}) do show[#show + 1] = k end
 
-	local base = snapshot(b.calcsTab.mainOutput)
+	local base = currentStats(b)
 	local bestLvl = {}
 	for _, e in ipairs(res) do
 		if e.group then
@@ -792,7 +851,7 @@ function methods.rank_options(p)
 		else
 			seen[text] = {}
 			evaluated = evaluated + 1
-			local ok, after = evalMods(b, mods)
+			local ok, after, _, components = evalMods(b, mods)
 			if ok then
 				local changed, score = measure(after)
 				local rowBase
@@ -810,12 +869,12 @@ function methods.rank_options(p)
 						end
 					end
 					if #assume > 0 then
-						local ok2, afterMet = evalMods(b, mods, assume)
+						local ok2, afterMet, _, componentsMet = evalMods(b, mods, assume)
 						local from = baselineFor(names, assume)
 						if ok2 and from then
 							local c2, s2 = measure(afterMet, from)
 							if c2 > changed or s2 > score then
-								after, changed, score, assumed, rowBase = afterMet, c2, s2, names, from
+								after, changed, score, assumed, rowBase, components = afterMet, c2, s2, names, from, componentsMet
 							end
 						end
 					end
@@ -834,7 +893,7 @@ function methods.rank_options(p)
 					end
 				end
 				rows[#rows + 1] = { src = e.src, name = e.name or e.id, id = e.id, mods = mods, matchedLinesOnly = partial, unsupported = unsupported, requires = requires,
-					spawnOn = e.spawnOn, score = score, statsChanged = changed, stats = deltas, assumed = assumed,
+					spawnOn = e.spawnOn, score = score, statsChanged = changed, stats = deltas, skillParts = components, assumed = assumed,
 					alsoFrom = seen[text], obtain = e.obtain, pathDist = status and status.pathDist,
 					alreadyOnBuild = status and status.allocated or nil }
 			end
