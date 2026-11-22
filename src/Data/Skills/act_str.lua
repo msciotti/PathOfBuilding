@@ -7848,18 +7848,32 @@ skills["MoltenStrike"] = {
 		local outerRadius = output.AreaOfEffectRadiusTertiary
 
 		-- logic adapted from MoldyDwarf's calculator
-		local hitRange = enemyRadius + ballRadius - innerRadius
-		local landingRange = outerRadius - innerRadius
-		local overlapChance = math.min(1, hitRange / landingRange)
+		local hitRange = enemyRadius + ballRadius
+		local overlapChance
+		local byArea = skillModList:Flag(skillCfg, "LandingSpreadByArea")
+		if byArea then
+			overlapChance = (math.min(hitRange, outerRadius) ^ 2 - innerRadius ^ 2) / (outerRadius ^ 2 - innerRadius ^ 2)
+		else
+			overlapChance = (hitRange - innerRadius) / (outerRadius - innerRadius)
+		end
+		overlapChance = math.max(0, math.min(1, overlapChance))
 		output.OverlapChance = overlapChance * 100
 
 		if breakdown then
 			breakdown.OverlapChance = { }
 			t_insert(breakdown.OverlapChance, "Chance for individual balls to land on the enemy:")
-			t_insert(breakdown.OverlapChance, "^8= (area where a ball can land on enemy) / (total area)")
-			t_insert(breakdown.OverlapChance, "^8= (enemy radius + ball radius - min travel) / (max travel - min travel)")
-			t_insert(breakdown.OverlapChance, s_format("^8= (^7%d^8 + ^7%d^8 - ^7%d) / (^7%d^8 - ^7%d)",
-				enemyRadius, ballRadius, innerRadius, outerRadius, innerRadius))
+			if byArea then
+				t_insert(breakdown.OverlapChance, "^8Balls land evenly over the area of the landing ring:")
+				t_insert(breakdown.OverlapChance, "^8= (reach squared - min travel squared) / (max travel squared - min travel squared)")
+				t_insert(breakdown.OverlapChance, "^8where reach = min(enemy radius + ball radius, max travel)")
+				t_insert(breakdown.OverlapChance, s_format("^8= (^7%d^8 * ^7%d^8 - ^7%d^8 * ^7%d^8) / (^7%d^8 * ^7%d^8 - ^7%d^8 * ^7%d^8)",
+					math.min(hitRange, outerRadius), math.min(hitRange, outerRadius), innerRadius, innerRadius, outerRadius, outerRadius, innerRadius, innerRadius))
+			else
+				t_insert(breakdown.OverlapChance, "^8Balls land evenly over the travel distance:")
+				t_insert(breakdown.OverlapChance, "^8= (enemy radius + ball radius - min travel) / (max travel - min travel)")
+				t_insert(breakdown.OverlapChance, s_format("^8= (^7%d^8 + ^7%d^8 - ^7%d) / (^7%d^8 - ^7%d)",
+					enemyRadius, ballRadius, innerRadius, outerRadius, innerRadius))
+			end
 			t_insert(breakdown.OverlapChance, s_format("^8=^7 %.2f^8%%", output.OverlapChance))
 		end
 
@@ -8043,18 +8057,32 @@ skills["MoltenStrikeAltX"] = {
 		local outerRadius = output.AreaOfEffectRadiusTertiary
 
 		-- logic adapted from MoldyDwarf's calculator
-		local hitRange = enemyRadius + ballRadius - innerRadius
-		local landingRange = outerRadius - innerRadius
-		local overlapChance = math.min(1, hitRange / landingRange)
+		local hitRange = enemyRadius + ballRadius
+		local overlapChance
+		local byArea = skillModList:Flag(skillCfg, "LandingSpreadByArea")
+		if byArea then
+			overlapChance = (math.min(hitRange, outerRadius) ^ 2 - innerRadius ^ 2) / (outerRadius ^ 2 - innerRadius ^ 2)
+		else
+			overlapChance = (hitRange - innerRadius) / (outerRadius - innerRadius)
+		end
+		overlapChance = math.max(0, math.min(1, overlapChance))
 		output.OverlapChance = overlapChance * 100
 
 		if breakdown then
 			breakdown.OverlapChance = { }
 			t_insert(breakdown.OverlapChance, "Chance for individual balls to land on the enemy:")
-			t_insert(breakdown.OverlapChance, "^8= (area where a ball can land on enemy) / (total area)")
-			t_insert(breakdown.OverlapChance, "^8= (enemy radius + ball radius - min travel) / (max travel - min travel)")
-			t_insert(breakdown.OverlapChance, s_format("^8= (^7%d^8 + ^7%d^8 - ^7%d) / (^7%d^8 - ^7%d)",
-				enemyRadius, ballRadius, innerRadius, outerRadius, innerRadius))
+			if byArea then
+				t_insert(breakdown.OverlapChance, "^8Balls land evenly over the area of the landing ring:")
+				t_insert(breakdown.OverlapChance, "^8= (reach squared - min travel squared) / (max travel squared - min travel squared)")
+				t_insert(breakdown.OverlapChance, "^8where reach = min(enemy radius + ball radius, max travel)")
+				t_insert(breakdown.OverlapChance, s_format("^8= (^7%d^8 * ^7%d^8 - ^7%d^8 * ^7%d^8) / (^7%d^8 * ^7%d^8 - ^7%d^8 * ^7%d^8)",
+					math.min(hitRange, outerRadius), math.min(hitRange, outerRadius), innerRadius, innerRadius, outerRadius, outerRadius, innerRadius, innerRadius))
+			else
+				t_insert(breakdown.OverlapChance, "^8Balls land evenly over the travel distance:")
+				t_insert(breakdown.OverlapChance, "^8= (enemy radius + ball radius - min travel) / (max travel - min travel)")
+				t_insert(breakdown.OverlapChance, s_format("^8= (^7%d^8 + ^7%d^8 - ^7%d) / (^7%d^8 - ^7%d)",
+					enemyRadius, ballRadius, innerRadius, outerRadius, innerRadius))
+			end
 			t_insert(breakdown.OverlapChance, s_format("^8=^7 %.2f^8%%", output.OverlapChance))
 		end
 

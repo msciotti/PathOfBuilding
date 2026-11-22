@@ -815,6 +815,11 @@ Huge sets the radius to 11.
 	{ var = "enemyRadius", type = "integer", label = "Enemy radius:", ifSkill = { "Seismic Trap", "Lightning Spire Trap", "Explosive Trap", "Molten Strike", "Ball Lightning" }, includeTransfigured = true, tooltip = "Configure the radius of an enemy hitbox to calculate some area overlapping (shotgunning) effects.", apply = function(val, modList, enemyModList)
 		modList:NewMod("EnemyRadius", "OVERRIDE", m_max(val, 1), "Config")
 	end },
+	{ var = "ballLandingSpread", type = "list", label = "Magma ball landing spread:", ifSkill = "Molten Strike", includeTransfigured = true, tooltip = "Whether magma balls land evenly over the travel distance or evenly over the area of the landing ring (less likely to reach the enemy).", list = {{val="DISTANCE",label="By distance"},{val="AREA",label="By area"}}, apply = function(val, modList, enemyModList)
+		if val == "AREA" then
+			modList:NewMod("LandingSpreadByArea", "FLAG", true, "Config")
+		end
+	end },
 	{ var = "returningBallHitChance", type = "countAllowZero", label = "Returning ball hit chance (%):", ifSkill = "Molten Strike", ifFlag = "ProjectilesReturn", includeTransfigured = true, defaultPlaceholderState = 50, tooltip = "The chance for a returning ball to hit the enemy on its way back.", apply = function(val, modList, enemyModList)
 		modList:NewMod("ReturningBallHitChance", "BASE", m_min(val, 100), "Config")
 	end },
