@@ -5005,6 +5005,8 @@ local specialModList = {
 	["grants immunity to freeze for (%d+) seconds if used while frozen"] = { flag("FreezeImmune", { type = "Condition", var = "UsingFlask" }) },
 	["grants immunity to chill for (%d+) seconds if used while chilled"] = { flag("ChillImmune", { type = "Condition", var = "UsingFlask" }) },
 	["grants immunity to shock for (%d+) seconds if used while shocked"] = { flag("ShockImmune", { type = "Condition", var = "UsingFlask" }) },
+	["grants immunity to maim for (%d+) seconds if used while maimed"] = { flag("MaimImmune", { type = "Condition", var = "UsingFlask" }) },
+	["grants immunity to hinder for (%d+) seconds if used while hindered"] = { flag("HinderImmune", { type = "Condition", var = "UsingFlask" }) },
 	["cannot be chilled while at maximum frenzy charges"] = { flag("ChillImmune", {type = "StatThreshold", stat = "FrenzyCharges", thresholdStat = "FrenzyChargesMax" }) },
 	["cannot be shocked while at maximum power charges"] = { flag("ShockImmune", {type = "StatThreshold", stat = "PowerCharges", thresholdStat = "PowerChargesMax" }) },
 	["you cannot be shocked while at maximum endurance charges"] = { flag("ShockImmune", {type = "StatThreshold", stat = "EnduranceCharges", thresholdStat = "EnduranceChargesMax" }) },

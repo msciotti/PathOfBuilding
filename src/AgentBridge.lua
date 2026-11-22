@@ -84,14 +84,17 @@ function methods.reload()
 	if not chunk then return { error = tostring(lerr) } end
 	local ok, fresh = pcall(chunk)
 	if not ok or type(fresh) ~= "table" then return { error = tostring(fresh) } end
-	for k in pairs(methods) do methods[k] = nil end
-	for k, v in pairs(fresh.methods) do methods[k] = v end
+	-- Update the table the running bridge dispatches from; after one reload this function belongs to a
+	-- fresh module whose own `methods` is not the live one.
+	local live = launch.agent and launch.agent.methods or methods
+	for k in pairs(live) do live[k] = nil end
+	for k, v in pairs(fresh.methods) do live[k] = v end
 	idx = nil
 	local f = io.open("AgentBridge.lua", "r")
 	local sz = f and #f:read("*a") or -1
 	if f then f:close() end
 	local names = {}
-	for k in pairs(methods) do names[#names + 1] = k end
+	for k in pairs(live) do names[#names + 1] = k end
 	table.sort(names)
 	return { reloaded = true, fileBytes = sz, methods = names, cwd = GetWorkDir and GetWorkDir() }
 end
@@ -111,14 +114,17 @@ end
 
 local function entryOut(e)
 	return { src = e.src, id = e.id, name = e.name, kind = e.kind, level = e.level, group = e.group,
-		lines = e.lines, tags = e.tags, spawnOn = e.spawnOn, ascendancy = e.ascendancy }
+		lines = e.lines, tags = e.tags, spawnOn = e.spawnOn, ascendancy = e.ascendancy, essenceSlots = e.essenceSlots }
 end
 
 function methods.search(p)
-	local res, total, by = AgentData.search(getIndex(), p.query or "", {
+	local res, total, by, terms = AgentData.search(getIndex(), p.query or "", {
 		sources = p.sources, slot = p.slot, limit = p.limit or 50, exact = p.exact })
 	local out = {}
-	for i, e in ipairs(res) do out[i] = entryOut(e) end
+	for i, e in ipairs(res) do
+		out[i] = entryOut(e)
+		if #e.lines > 3 then out[i].matched = AgentData.matchedLines(e, terms) end
+	end
 	local note
 	if total > #out then note = "truncated: raise limit or add sources/slot filters" end
 	return { total = total, bySource = by, results = out, note = note,
@@ -131,49 +137,66 @@ function methods.inspect(p)
 	return { path = p.path, value = project(v, p.depth or 2, {}, p.maxKeys or 80) }
 end
 
+local function mainSkillInfo(b)
+	local env_ = b.calcsTab and b.calcsTab.mainEnv
+	local skill = env_ and env_.player and env_.player.mainSkill
+	if not skill then return nil end
+	local types = {}
+	for id, on in pairs(skill.skillTypes or {}) do
+		if on then
+			for name, v in pairs(SkillType or {}) do
+				if v == id then types[#types + 1] = name end
+			end
+		end
+	end
+	table.sort(types)
+	return { name = skill.activeEffect and skill.activeEffect.grantedEffect and skill.activeEffect.grantedEffect.name,
+		types = types }
+end
+
 function methods.get_state()
 	local b = env().build
 	if not b then return { error = "no build loaded" } end
 	return {
 		class = b.spec and b.spec.curClassName, ascendancy = b.spec and b.spec.curAscendClassName,
-		level = b.characterLevel, stats = project(b.calcsTab and b.calcsTab.mainOutput or {}, 1, {}, 2000),
+		level = b.characterLevel, mainSkill = mainSkillInfo(b),
+		dpsHint = "Use CombinedDPS (or TotalDPS for hits only) as a DPS goal. FullDPS is only set when skills are marked for Full DPS; PoisonDPS/BleedDPS are per stack, so use WithPoisonDPS/WithBleedDPS or CombinedDPS.",
+		stats = project(b.calcsTab and b.calcsTab.mainOutput or {}, 1, {}, 2000),
 	}
 end
 
+-- Output stat names an agent can use with what_if/rank_options/find_by_effect, with PoB's sidebar label where it
+-- has one. params: { query = "avoid" (optional case-insensitive filter on name or label) }
+function methods.list_stats(p)
+	local b = env().build
+	if not b then return { error = "no build loaded" } end
+	local labels = {}
+	for _, ds in ipairs(b.displayStats or {}) do
+		if ds.stat and ds.label and not labels[ds.stat] then labels[ds.stat] = ds.label end
+	end
+	local q = p.query and p.query:lower()
+	local out = {}
+	for k, v in pairs(b.calcsTab.mainOutput) do
+		local t = type(v)
+		if (t == "number" or t == "boolean") and (not q or k:lower():find(q, 1, true) or (labels[k] or ""):lower():find(q, 1, true)) then
+			out[#out + 1] = { stat = k, label = labels[k], value = t == "boolean" and (v and 1 or 0) or v }
+		end
+	end
+	table.sort(out, function(a, b) return a.stat < b.stat end)
+	return { count = #out, stats = out, note = "Boolean outputs are shown as 0/1. Values are for the build as configured." }
+end
+
+-- Numeric outputs, plus boolean outputs as 0/1 (e.g. MaimImmunity) so diffs can see them.
 local function snapshot(out)
 	local t = {}
-	for k, v in pairs(out) do if type(v) == "number" then t[k] = v end end
+	for k, v in pairs(out) do
+		if type(v) == "number" then t[k] = v
+		elseif type(v) == "boolean" then t[k] = v and 1 or 0 end
+	end
 	return t
 end
 
-local function recalc(b)
-	b.configTab:BuildModList()
-	b.calcsTab:BuildOutput()
-	return snapshot(b.calcsTab.mainOutput)
-end
-
--- Apply extra mod text as a temporary Config custom-mod block, diff stats, then remove it.
--- params: { mods = {"Cannot be Poisoned", ...}, stats = {"Life","TotalDPS"} (optional filter) }
-function methods.what_if(p)
-	local b = env().build
-	if not b then return { error = "no build loaded" } end
-	local list = b.configTab.configSets[b.configTab.activeConfigSetId].customModsList
-	local base = snapshot(b.calcsTab.mainOutput)
-	local block = { title = "__agent_what_if", enabled = true, text = table.concat(p.mods or {}, "\n") }
-	list[#list + 1] = block
-	local ok, after = pcall(recalc, b)
-	for i = #list, 1, -1 do if list[i] == block then table.remove(list, i) end end
-	local ok2 = pcall(recalc, b)
-	if not ok then return { error = tostring(after) } end
-	local diff, want = {}, nil
-	if p.stats then want = {} for _, k in ipairs(p.stats) do want[k] = true end end
-	for k, v in pairs(after) do
-		local o = base[k] or 0
-		if (not want or want[k]) and math.abs(v - o) > 1e-9 then diff[k] = { before = o, after = v, delta = v - o } end
-	end
-	return { applied = p.mods, changed = diff, restored = ok2 }
-end
-
+-- Item text writes rolls as "(12-14)"; PoB resolves them before parsing, so do the same.
 local function resolveRanges(line, roll)
 	return (line:gsub("%((%-?[%d%.]+)%-(%-?[%d%.]+)%)", function(a, b)
 		a, b = tonumber(a), tonumber(b)
@@ -183,6 +206,387 @@ local function resolveRanges(line, roll)
 	end))
 end
 
+-- What a parsed mod needs before it applies, from its tags. `assume` is the extra mods that make it apply
+-- for a "conditions met" evaluation; `unmet` lists requirements that can't be forced that way.
+local function requirements(mods)
+	local reqs, assume, unmet, seen = {}, {}, {}, {}
+	local b = env().build
+	local out = b and b.calcsTab.mainOutput or {}
+	local mainEnv = b and b.calcsTab.mainEnv
+	local db = mainEnv and mainEnv.player and mainEnv.player.modDB
+	local function add(kind, desc, mod, noteOnly)
+		if seen[desc] then return end
+		seen[desc] = true
+		local met
+		if mod and mod.name and mod.type == "FLAG" and db then met = db:Flag(nil, mod.name) or false
+		elseif mod and mod.clear and db then met = not db:Flag(nil, mod.clear) end
+		reqs[#reqs + 1] = { kind = kind, desc = desc, metOnBuild = met }
+		if mod then assume[#assume + 1] = mod elseif not noteOnly then unmet[#unmet + 1] = desc end
+	end
+	for _, m in ipairs(mods or {}) do
+		-- Flask effect/duration mods only show while flasks are active
+		if type(m.name) == "string" and m.name:match("^Flask") and not m.name:match("Charge") then
+			add("flasks", "equipped flasks active", { flasks = true })
+		end
+		for _, t in ipairs(m) do
+			if t.type == "Condition" and not t.neg then
+				for _, var in ipairs(t.varList or { t.var }) do
+					add("condition", var, { name = "Condition:" .. var, type = "FLAG", value = true })
+					if var == "UsingFlask" then add("flasks", "equipped flasks active", { flasks = true }) end
+					if t.varList then break end -- any one of the list satisfies it
+				end
+			elseif t.type == "Condition" and t.neg and t.var then
+				add("condition", "not " .. t.var, { clear = "Condition:" .. t.var })
+			elseif t.type == "Condition" and t.neg then
+				add("condition", "not " .. table.concat(t.varList or {}, "/"))
+			elseif t.type == "ItemCondition" then
+				local parts = {}
+				for k, v in pairs(t) do
+					if k ~= "type" and k ~= "itemSlot" then parts[#parts + 1] = k .. "=" .. tostring(v) end
+				end
+				table.sort(parts)
+				local slot = (t.itemSlot or "{SlotName}"):find("{SlotName}", 1, true) and "this item" or t.itemSlot
+				add("item", "item condition on " .. slot .. ": " .. table.concat(parts, ", ") .. " (depends on the actual item; can't be forced)", nil, true)
+			elseif t.type == "MultiplierThreshold" and not t.upper and t.var then
+				add("multiplier", t.var .. " >= " .. tostring(t.threshold), { name = "Multiplier:" .. t.var, type = "BASE", value = tonumber(t.threshold) or 1 })
+			elseif t.type == "MultiplierThreshold" then
+				add("multiplier", tostring(t.var or "?") .. (t.upper and " <= " or " >= ") .. tostring(t.threshold))
+			elseif t.type == "Multiplier" and t.var then
+				-- "per Frenzy Charge" etc.: scales with a count. Charges can be assumed at their maximum.
+				local maxCharges = t.var:match("Charge$") and tonumber(out[t.var .. "sMax"])
+				if maxCharges and maxCharges > 0 then
+					add("scales", "per " .. t.var .. " (assumed at max " .. maxCharges .. ")", { name = "Multiplier:" .. t.var, type = "BASE", value = maxCharges })
+				else
+					add("scales", "per " .. t.var, nil, true)
+				end
+			elseif t.type == "StatThreshold" then
+				add("stat", tostring(t.stat) .. (t.upper and " <= " or " >= ") .. tostring(t.threshold or t.thresholdStat))
+			elseif t.type == "ActorCondition" and (t.var or t.varList) then
+				add("actor", tostring(t.actor) .. ": " .. tostring(t.var or table.concat(t.varList, "/")))
+			end
+		end
+	end
+	return reqs, assume, unmet
+end
+
+-- ModFlag/KeywordFlag bit masks as names, e.g. flags=4 -> {"Hit"}: a FLAG mod with Hit/Attack/Spell flags only
+-- applies in those contexts (e.g. "on Hit"), which explains mods that parse but never show up.
+local function flagNames(mask, tbl)
+	if not mask or mask == 0 or not tbl then return nil end
+	local names = {}
+	for name, v in pairs(tbl) do
+		if type(v) == "number" and v > 0 and name ~= "SourceMask" and bit.band(mask, v) == v then names[#names + 1] = name end
+	end
+	table.sort(names)
+	return #names > 0 and names or nil
+end
+
+-- How PoB's mod parser reads one line. supported=false means PoB ignores it entirely;
+-- `extra` is the part it could not understand (PoB then drops the whole line).
+local function parseLine(line, roll)
+	local resolved = resolveRanges(StripEscapes(line), roll or "max"):match("^%s*(.-)%s*$")
+	local mods, extra = modLib.parseMod(resolved)
+	local out = {}
+	for i, m in ipairs(mods or {}) do
+		local tags = {}
+		for _, t in ipairs(m) do
+			local tag = {}
+			for k, v in pairs(t) do if type(v) ~= "table" then tag[k] = v end end
+			tags[#tags + 1] = tag
+		end
+		out[i] = { name = m.name, type = m.type, value = type(m.value) ~= "table" and m.value or project(m.value, 2, {}, 20), tags = tags,
+			flags = flagNames(m.flags, ModFlag), keywordFlags = flagNames(m.keywordFlags, KeywordFlag) }
+	end
+	local reqs, assume, unmet = requirements(mods)
+	return { line = line, resolved = resolved ~= line and resolved or nil, supported = mods ~= nil and not extra,
+		extra = extra, mods = out, requires = #reqs > 0 and reqs or nil, _assume = assume, _unmet = unmet }
+end
+
+-- params: { lines = {"Cannot be Poisoned", ...}, roll = "max"|"mid"|"min" }. Shows what PoB's parser turns
+-- each line into, and any conditions/thresholds the mod needs before it applies.
+function methods.parse_mod(p)
+	local res = {}
+	for i, l in ipairs(p.lines or { p.line }) do
+		local r = parseLine(l, p.roll)
+		r._assume, r._unmet = nil, nil
+		res[i] = r
+	end
+	return { results = res }
+end
+
+-- Summed value of each mod name in the calculated player modDB (FLAG mods as 0/1), for mods that change a total
+-- without any output stat showing it (e.g. FlaskDuration).
+local function modTotals(b, names)
+	local env_ = b.calcsTab.mainEnv
+	local db = env_ and (env_.player and env_.player.modDB or env_.modDB)
+	if not db or not names then return nil end
+	local t = {}
+	for name, ty in pairs(names) do
+		if ty == "FLAG" then t[name] = db:Flag(nil, name) and 1 or 0
+		elseif ty == "BASE" or ty == "INC" or ty == "MORE" then t[name .. ":" .. ty] = db:Sum(ty, nil, name) end
+	end
+	return t
+end
+
+-- extra: mods added straight to the config mod list for this calc only (used to force conditions on); an entry
+-- { flasks = true } activates every equipped flask for this calc.
+local function recalc(b, extra, totalsFor)
+	-- Config checkboxes to switch on for this calc only (e.g. "Is the enemy Exposed to Lightning?")
+	local input = b.configTab.configSets[b.configTab.activeConfigSetId].input
+	local configSaved = {}
+	for _, m in ipairs(extra or {}) do
+		if m.config and configSaved[m.config] == nil then
+			configSaved[m.config] = input[m.config] or false
+			input[m.config] = true
+		end
+	end
+	b.configTab:BuildModList()
+	for var, old in pairs(configSaved) do input[var] = old or nil end
+	local flaskSlots = {}
+	for _, m in ipairs(extra or {}) do
+		if m.config then
+			-- applied above
+		elseif m.raw then
+			b.configTab.modList:AddMod(m.raw)
+		elseif m.clear then
+			local list = b.configTab.modList
+			for i = #list, 1, -1 do
+				if list[i].name == m.clear then table.remove(list, i) end
+			end
+		elseif m.flasks then
+			for _, slot in ipairs(b.itemsTab.orderedSlots or {}) do
+				if slot.slotName:match("^Flask %d") and not slot.active then
+					slot.active = true
+					flaskSlots[#flaskSlots + 1] = slot
+				end
+			end
+		else
+			b.configTab.modList:NewMod(m.name, m.type, m.value, "Agent assumption")
+		end
+	end
+	local ok, err = pcall(b.calcsTab.BuildOutput, b.calcsTab)
+	for _, slot in ipairs(flaskSlots) do slot.active = false end
+	if not ok then error(err, 0) end
+	return snapshot(b.calcsTab.mainOutput), modTotals(b, totalsFor)
+end
+
+-- JSON can't carry inf/nan (dkjson writes null), so report them as strings.
+local function jsonNumber(v)
+	if v ~= v or v == math.huge or v == -math.huge then return tostring(v) end
+	return v
+end
+
+local function diffStats(base, after, want)
+	local diff = {}
+	for k, v in pairs(after) do
+		local o = base[k] or 0
+		if (not want or want[k]) and v ~= o and not (math.abs(v - o) <= 1e-9) then
+			diff[k] = { before = jsonNumber(o), after = jsonNumber(v), delta = jsonNumber(v - o) }
+		end
+	end
+	return diff
+end
+
+-- Evaluate mod text on the open build, then restore it.
+local function evalMods(b, lines, extra, totalsFor)
+	local list = b.configTab.configSets[b.configTab.activeConfigSetId].customModsList
+	local block = { title = "__agent_what_if", enabled = true, text = table.concat(lines, "\n") }
+	list[#list + 1] = block
+	local ok, after, totals = pcall(recalc, b, extra, totalsFor)
+	for i = #list, 1, -1 do if list[i] == block then table.remove(list, i) end end
+	return ok, after, totals
+end
+
+local function mainSkill(b)
+	local env_ = b.calcsTab and b.calcsTab.mainEnv
+	return env_ and env_.player and env_.player.mainSkill
+end
+
+local configOptionList
+local function configOptions()
+	configOptionList = configOptionList or LoadModule("Modules/ConfigOptions")
+	return configOptionList
+end
+
+local function mainSocketSlot(b)
+	local s = mainSkill(b)
+	local slot = s and s.socketGroup and s.socketGroup.slot
+	return slot and slot:gsub(" Swap", "") or nil
+end
+
+local function mainIsSpell(b)
+	local s = mainSkill(b)
+	return s and s.skillTypes and s.skillTypes[SkillType.Spell] and not s.skillTypes[SkillType.Attack]
+end
+
+local function attackOnly(flags)
+	for _, f in ipairs(flags) do if f == "Attack" or f == "Melee" then return true end end
+	return false
+end
+
+local function assumedNames(assume)
+	local names = {}
+	for _, m in ipairs(assume) do
+		names[#names + 1] = m.config and ("Config: " .. m.label) or m.raw and ("socketed in " .. tostring(m.raw[1] and m.raw[1].slotName or "slot")) or m.flasks and "equipped flasks active" or m.clear and ("not " .. m.clear)
+			or (m.name .. (m.type == "BASE" and (" = " .. m.value) or ""))
+	end
+	return names
+end
+
+-- Apply extra mod text as a temporary Config custom-mod block, diff stats, then remove it.
+-- params: { mods = {"Cannot be Poisoned", ...}, stats = {"Life","TotalDPS"} (optional filter; these are
+--   always reported, changed or not), roll = "max"|"mid"|"min" for "(a-b)" ranges, assume = false to skip
+--   the conditions-met evaluation }
+-- Conditional mods (flask "during Effect", "while affected by Purity of Ice", "at 25 Rage"...) often do
+-- nothing on the build as configured; `ifConditionsMet` re-evaluates with those requirements forced on.
+function methods.what_if(p)
+	local b = env().build
+	if not b then return { error = "no build loaded" } end
+	local base = snapshot(b.calcsTab.mainOutput)
+	local lines, unsupported, reqs, assume, unmet, seen, names = {}, {}, {}, {}, {}, {}, {}
+	local alreadyKeystone, socketedMods, socketedInfo, flagMismatch, hitOnly = {}, {}, {}, {}, {}
+	for _, l in ipairs(p.mods or {}) do
+		local r = parseLine(l, p.roll)
+		local socketed = {}
+		if r.supported then
+			-- "+1 to Level of Socketed Gems" only applies to gems in the item's slot; a custom-mod block has no
+			-- slot, so add these mods directly, bound to `slot` (default: the main skill's socket group slot)
+			for _, m in ipairs(modLib.parseMod(r.resolved or l) or {}) do
+				for _, t in ipairs(m) do
+					if t.type == "SocketedIn" and t.slotName == "{SlotName}" then socketed[#socketed + 1] = m break end
+				end
+			end
+		end
+		if #socketed > 0 then
+			local slot = p.slot or mainSocketSlot(b)
+			if slot then
+				for _, m in ipairs(socketed) do
+					local c = copyTable(m)
+					for _, t in ipairs(c) do if t.type == "SocketedIn" and t.slotName == "{SlotName}" then t.slotName = slot end end
+					socketedMods[#socketedMods + 1] = { raw = c }
+				end
+				socketedInfo[#socketedInfo + 1] = { line = l, slot = slot }
+			else
+				unsupported[#unsupported + 1] = { line = l, extra = "socketed-gem mod: pass `slot` (main skill has no socket slot)" }
+			end
+		else
+			lines[#lines + 1] = r.resolved or l
+		end
+		for _, m in ipairs(r.mods) do
+			if ((m.flags and attackOnly(m.flags)) or (m.keywordFlags and attackOnly(m.keywordFlags))) and mainIsSpell(b) then flagMismatch[#flagMismatch + 1] = l break end
+		end
+		for _, m in ipairs(r.mods) do
+			if m.type == "FLAG" and m.flags and m.name:match("^Condition:") then hitOnly[#hitOnly + 1] = l break end
+		end
+		for _, m in ipairs(r.mods) do
+			names[m.name] = m.type
+			if m.name == "Keystone" and type(m.value) == "string" and b.spec.allocNodes then
+				for _, n in pairs(b.spec.allocNodes) do
+					if n.dn == m.value then alreadyKeystone[#alreadyKeystone + 1] = m.value end
+				end
+			end
+		end
+		if not r.supported then unsupported[#unsupported + 1] = { line = l, extra = r.extra } end
+		for _, q in ipairs(r.requires or {}) do
+			if not seen[q.desc] then seen[q.desc] = true reqs[#reqs + 1] = q end
+		end
+		for _, m in ipairs(r._assume) do assume[#assume + 1] = m end
+		for _, u in ipairs(r._unmet) do unmet[#unmet + 1] = u end
+	end
+	local want
+	if p.stats then want = {} for _, k in ipairs(p.stats) do want[k] = true end end
+
+	local totalsBefore = modTotals(b, names)
+	local flagsBefore = copyTable((mainSkill(b) or {}).skillFlags or {}, true)
+	local ok, after, totalsAfter = evalMods(b, lines, socketedMods, names)
+	for _, m in ipairs(socketedMods) do table.insert(assume, 1, m) end
+	-- Some mods only unlock a Config checkbox (exposure/"chance to X on Hit" sets a skill flag that shows the
+	-- option); report those and switch them on in ifConditionsMet
+	if ok then
+		local flagsAfter = (mainSkill(b) or {}).skillFlags or {}
+		local input = b.configTab.configSets[b.configTab.activeConfigSetId].input
+		for _, opt in ipairs(configOptions()) do
+			local gates = type(opt.ifFlag) == "table" and opt.ifFlag or { opt.ifFlag }
+			for _, f in ipairs(opt.ifFlag and gates or {}) do
+				if opt.type == "check" and flagsAfter[f] and not flagsBefore[f] and not input[opt.var] then
+					local label = StripEscapes(opt.label or opt.var)
+					reqs[#reqs + 1] = { kind = "config", desc = "Config: " .. label, metOnBuild = false }
+					assume[#assume + 1] = { config = opt.var, label = label }
+					break
+				end
+			end
+		end
+	end
+	local met
+	-- Skip the forced re-evaluation when every requirement already holds as configured
+	local needsAssume = false
+	for _, q in ipairs(reqs) do if q.metOnBuild ~= true then needsAssume = true end end
+	if ok and #assume > 0 and p.assume ~= false and needsAssume then
+		local ok3, afterMet = evalMods(b, lines, assume)
+		if ok3 then
+			met = { assumed = assumedNames(assume), cannotForce = #unmet > 0 and unmet or nil, changed = diffStats(base, afterMet, want) }
+		end
+	end
+	local ok2 = pcall(recalc, b)
+	if not ok then return { error = tostring(after) } end
+
+	local diff = diffStats(base, after, want)
+	local current, changedOther
+	if want then
+		current = {}
+		for k in pairs(want) do current[k] = base[k] end
+		-- The stats filter must not hide that something else moved (e.g. FireResist capped, FireResistOverCap up)
+		if next(diff) == nil then
+			for k, v in pairs(diffStats(base, after)) do
+				changedOther = changedOther or {}
+				changedOther[k] = v
+			end
+		end
+	end
+	local capped = {}
+	for k in pairs(want or diff) do
+		local v, cap = base[k], base[k .. "Max"]
+		if type(v) == "number" and type(cap) == "number" and v >= cap then capped[#capped + 1] = k .. " at cap " .. cap end
+	end
+	for k in pairs(changedOther or diff) do
+		local stem = k:match("^(.-)OverCap") or k:match("^(.-)Overcap")
+		if stem and not (diff[stem] or (changedOther and changedOther[stem])) then capped[#capped + 1] = stem .. " is capped; only " .. k .. " moved" end
+	end
+	table.sort(capped)
+	-- Mod-name totals before/after, for effects no output stat shows (FlaskDuration, FlaskChargesGained...)
+	local totals
+	if totalsBefore and totalsAfter then
+		for k, v in pairs(totalsAfter) do
+			local o = totalsBefore[k] or 0
+			if v ~= o then totals = totals or {} totals[k] = { before = o, after = v } end
+		end
+	end
+	local note
+	if #alreadyKeystone > 0 then
+		note = "Keystone already allocated on this build: " .. table.concat(alreadyKeystone, ", ")
+	elseif #hitOnly > 0 and next(diff) == nil then
+		note = "These grant a buff/condition only in a Hit/attack context, which PoB doesn't model as a static effect; enable the matching Config option (e.g. Onslaught) to see it: " .. table.concat(hitOnly, "; ")
+	elseif #flagMismatch > 0 and next(diff) == nil then
+		note = "Attack-only mod(s) and the main skill is a spell: " .. table.concat(flagMismatch, "; ")
+	elseif #capped > 0 and next(diff) == nil then
+		note = "Capped: " .. table.concat(capped, "; ")
+	elseif changedOther then
+		note = "None of the requested stats changed, but other stats did: see changedOther."
+	elseif next(diff) == nil and #unsupported == 0 then
+		if met and next(met.changed) then
+			note = "No effect as the build is configured; see ifConditionsMet for the effect once its requirements hold."
+		elseif totals then
+			note = "No output stat shows this, but the mod totals in `modTotals` changed."
+		elseif #reqs > 0 then
+			note = "No effect even with requirements forced on; it may need something that can't be forced (see requires) or the build already has the effect."
+		else
+			note = "Parsed but no output stat changed: the build may already have this effect (check `current` via stats) or it isn't shown in calc output."
+		end
+	end
+	return { applied = lines, changed = diff, current = current, requires = #reqs > 0 and reqs or nil,
+		ifConditionsMet = met, modTotals = totals, socketedAppliedTo = #socketedInfo > 0 and socketedInfo or nil, changedOther = changedOther, capped = #capped > 0 and capped or nil, unsupported = #unsupported > 0 and unsupported or nil, restored = ok2, note = note }
+end
+
 -- Evaluate every search hit as a what-if, rank by a goal.
 -- params: search params + { goal = "TotalDPS" | {Life=1,TotalDPS=0.5}, roll = "max"|"mid"|"min",
 --   max = 500, budget = 120 (seconds), top = 25, stats = {extra stats to show} }
@@ -190,7 +594,7 @@ end
 function methods.rank_options(p)
 	local b = env().build
 	if not b then return { error = "no build loaded" } end
-	local res, total = AgentData.search(getIndex(), p.query or "", {
+	local res, total, _, terms = AgentData.search(getIndex(), p.query or "", {
 		sources = p.sources, slot = p.slot, limit = 100000, exact = p.exact })
 	local goal = {}
 	if type(p.goal) == "string" then goal[p.goal] = 1
@@ -199,7 +603,6 @@ function methods.rank_options(p)
 	for k in pairs(goal) do show[#show + 1] = k end
 	for _, k in ipairs(p.stats or {}) do show[#show + 1] = k end
 
-	local list = b.configTab.configSets[b.configTab.activeConfigSetId].customModsList
 	local base = snapshot(b.calcsTab.mainOutput)
 	local bestLvl = {}
 	for _, e in ipairs(res) do
@@ -208,44 +611,83 @@ function methods.rank_options(p)
 			if (bestLvl[k] or -1) < (e.level or 0) then bestLvl[k] = e.level or 0 end
 		end
 	end
+	local function measure(after)
+		local changed, score = 0, 0
+		for k, v in pairs(after) do
+			if math.abs(v - (base[k] or 0)) > 1e-9 then changed = changed + 1 end
+		end
+		for k, w in pairs(goal) do
+			local o, v = base[k] or 0, after[k] or 0
+			-- (after-before)/max(|before|,|after|): one bounded scale (-1..1) even when before is 0
+			local d = math.max(math.abs(o), math.abs(v))
+			if d > 0 and v == v and o == o and d ~= math.huge then score = score + w * (v - o) / d end
+		end
+		return changed, score
+	end
 	local seen, rows, skipped = {}, {}, 0
 	local t0, budget, cap = os.clock(), p.budget or 120, p.max or 500
 	local evaluated, timedOut = 0, false
 	for _, e in ipairs(res) do
 		if evaluated >= cap then break end
 		if os.clock() - t0 > budget then timedOut = true break end
-		local mods = {}
+		local mods, partial = {}, nil
 		if e.group and (e.level or 0) < (bestLvl[e.src .. "|" .. e.group] or 0) and (p.roll or "max") == "max" then
 			skipped = skipped + 1
 		else
-			for _, l in ipairs(e.lines) do mods[#mods + 1] = resolveRanges(l, p.roll or "max") end
+			-- Uniques carry every variant's lines; score only the lines that match the query
+			local lines = e.lines
+			if e.src:find("^unique") and #lines > 3 then
+				lines, partial = AgentData.matchedLines(e, terms), true
+			end
+			for _, l in ipairs(lines) do mods[#mods + 1] = resolveRanges(l, p.roll or "max") end
 		end
 		local text = table.concat(mods, "\n")
 		if #mods == 0 or seen[text] then skipped = skipped + 1
 		else
 			seen[text] = true
 			evaluated = evaluated + 1
-			local block = { title = "__agent_rank", enabled = true, text = text }
-			list[#list + 1] = block
-			local ok, after = pcall(recalc, b)
-			for i = #list, 1, -1 do if list[i] == block then table.remove(list, i) end end
+			local ok, after = evalMods(b, mods)
 			if ok then
-				local changed, score = 0, 0
-				for k, v in pairs(after) do
-					local o = base[k] or 0
-					if math.abs(v - o) > 1e-9 then changed = changed + 1 end
-				end
-				for k, w in pairs(goal) do
-					local o, v = base[k] or 0, after[k] or 0
-					local rel = o ~= 0 and (v - o) / math.abs(o) or (v - o)
-					score = score + w * rel
+				local changed, score = measure(after)
+				-- Conditional sources do nothing as configured; re-score them with their requirements forced on
+				local assumed
+				if (changed == 0 or score == 0) and p.assume ~= false then
+					local assume, names, seenName = {}, {}, {}
+					for _, l in ipairs(mods) do
+						for _, m in ipairs(parseLine(l)._assume) do
+							local name = assumedNames({ m })[1]
+							if not seenName[name] then
+								seenName[name] = true
+								assume[#assume + 1] = m
+								names[#names + 1] = name
+							end
+						end
+					end
+					if #assume > 0 then
+						local ok2, afterMet = evalMods(b, mods, assume)
+						if ok2 then
+							local c2, s2 = measure(afterMet)
+							if c2 > changed or s2 > score then
+								after, changed, score, assumed = afterMet, c2, s2, names
+							end
+						end
+					end
 				end
 				local deltas = {}
 				for _, k in ipairs(show) do
 					deltas[k] = { before = base[k] or 0, after = after[k] or 0 }
 				end
-				rows[#rows + 1] = { src = e.src, name = e.name or e.id, id = e.id, mods = mods,
-					spawnOn = e.spawnOn, score = score, statsChanged = changed, stats = deltas }
+				local unsupported, requires
+				for _, l in ipairs(mods) do
+					local r = parseLine(l)
+					if not r.supported then unsupported = unsupported or {} unsupported[#unsupported + 1] = l end
+					for _, q in ipairs(r.requires or {}) do
+						requires = requires or {}
+						requires[#requires + 1] = q.desc .. (q.metOnBuild and " (met)" or q.metOnBuild == false and " (not met)" or "")
+					end
+				end
+				rows[#rows + 1] = { src = e.src, name = e.name or e.id, id = e.id, mods = mods, matchedLinesOnly = partial, unsupported = unsupported, requires = requires,
+					spawnOn = e.spawnOn, score = score, statsChanged = changed, stats = deltas, assumed = assumed }
 			end
 		end
 	end
@@ -253,13 +695,18 @@ function methods.rank_options(p)
 	local useGoal = next(goal) ~= nil
 	table.sort(rows, function(x, y)
 		if useGoal and x.score ~= y.score then return x.score > y.score end
+		if (x.assumed == nil) ~= (y.assumed == nil) then return x.assumed == nil end
 		if x.statsChanged ~= y.statsChanged then return x.statsChanged > y.statsChanged end
 		return x.name < y.name
 	end)
-	local top = {}
-	for i = 1, math.min(#rows, p.top or 25) do top[i] = rows[i] end
-	return { candidates = total, evaluated = evaluated, duplicatesSkipped = skipped, timedOut = timedOut,
-		seconds = os.clock() - t0, roll = p.roll or "max", ranked = top }
+	local top, noEffect = {}, 0
+	for _, r in ipairs(rows) do
+		if useGoal and r.score == 0 then noEffect = noEffect + 1
+		elseif #top < (p.top or 25) then top[#top + 1] = r end
+	end
+	return { candidates = total, evaluated = evaluated, duplicatesSkipped = skipped, timedOut = timedOut, noEffect = noEffect,
+		seconds = os.clock() - t0, roll = p.roll or "max", ranked = top,
+		note = "Rows with `assumed` only score that way once those conditions hold (flask active, aura on, threshold reached...)." }
 end
 
 local function normLine(l)
@@ -308,24 +755,35 @@ function methods.probe_batch(p)
 	loadEffects()
 	if p.reset then effects = {} queue = nil end
 	if not queue then buildQueue() end
-	local list = b.configTab.configSets[b.configTab.activeConfigSetId].customModsList
 	local base = snapshot(b.calcsTab.mainOutput)
+	local function deltas(after)
+		local d, n = {}, 0
+		for k, v in pairs(after) do
+			local o = base[k] or 0
+			if math.abs(v - o) > 1e-9 then d[k] = v - o n = n + 1 end
+		end
+		return d, n
+	end
 	local t0, done = os.clock(), 0
 	while qpos <= #queue and os.clock() - t0 < (p.budget or 60) do
 		local q = queue[qpos]
 		qpos = qpos + 1
-		local block = { title = "__agent_probe", enabled = true, text = q.text }
-		list[#list + 1] = block
-		local ok, after = pcall(recalc, b)
-		for i = #list, 1, -1 do if list[i] == block then table.remove(list, i) end end
-		local d, n = {}, 0
-		if ok then
-			for k, v in pairs(after) do
-				local o = base[k] or 0
-				if math.abs(v - o) > 1e-9 then d[k] = v - o n = n + 1 end
+		local parsed = parseLine(q.text)
+		local fx = { text = q.text }
+		if not parsed.supported then
+			fx.d, fx.n, fx.unsupported = {}, 0, true
+		else
+			local ok, after = evalMods(b, { q.text })
+			if ok then fx.d, fx.n = deltas(after) else fx.d, fx.n, fx.err = {}, 0, true end
+			-- Conditional lines: also record the effect with their requirements forced on
+			if #parsed._assume > 0 then
+				local okm, afterMet = evalMods(b, { q.text }, parsed._assume)
+				if okm then fx.dm, fx.nm = deltas(afterMet) end
+				fx.req = {}
+				for _, r in ipairs(parsed.requires) do fx.req[#fx.req + 1] = r.desc end
 			end
 		end
-		effects[q.k] = { text = q.text, d = d, n = n, err = (not ok) or nil }
+		effects[q.k] = fx
 		done = done + 1
 		if done % 25 == 0 then collectgarbage() end
 	end
@@ -353,42 +811,65 @@ function methods.find_by_effect(p)
 			for _, s in ipairs(e.spawnOn) do if s == p.slot then ok = true break end end
 		end
 		if ok then
-			local best, via
+			local best, via, req, metNow
+			local function consider(d, l, r, met)
+				if d and ((dir == "up" and d > (p.min or 0)) or (dir == "down" and d < -(p.min or 0))) then
+					-- effects that work on the build as configured win ties over ones needing assumptions
+					if not best or math.abs(d) > math.abs(best) or (math.abs(d) == math.abs(best) and not metNow and met) then
+						best, via, req, metNow = d, l, r, met
+					end
+				end
+			end
 			for _, l in ipairs(e.lines) do
 				local fx = effects[normLine(l)]
-				local d = fx and fx.d[p.stat]
-				if d and ((dir == "up" and d > (p.min or 0)) or (dir == "down" and d < -(p.min or 0))) then
-					-- re-resolve at the entry's own max roll would need a probe; report probed max-roll delta
-					if not best or math.abs(d) > math.abs(best) then best, via = d, l end
+				if fx then
+					-- delta is the probed max-roll value, not this entry's own roll. A conditional line can move the
+					-- stat as configured (its condition already holds on this build); still report what it needs.
+					consider(fx.d and fx.d[p.stat], l, fx.req, true)
+					if p.conditional ~= false and fx.dm then consider(fx.dm[p.stat], l, fx.req, false) end
 				end
 			end
 			if best then
 				total = total + 1
-				hits[#hits + 1] = { src = e.src, name = e.name or e.id, delta = best, line = via, spawnOn = e.spawnOn,
-					allLines = e.lines, level = e.level, group = e.group }
+				hits[#hits + 1] = { src = e.src, name = e.name or e.id, delta = best, line = via, requires = req,
+					requirementsMetOnBuild = req and metNow or nil,
+					spawnOn = e.spawnOn, allLines = e.lines, level = e.level, group = e.group }
 			end
 		end
 	end
-	table.sort(hits, function(x, y) return math.abs(x.delta) > math.abs(y.delta) end)
+	local function rankKey(h)
+		if not h.requires then return 0 end
+		return h.requirementsMetOnBuild and 1 or 2
+	end
+	table.sort(hits, function(x, y)
+		if math.abs(x.delta) ~= math.abs(y.delta) then return math.abs(x.delta) > math.abs(y.delta) end
+		return rankKey(x) < rankKey(y)
+	end)
 	local out = {}
 	for i = 1, math.min(#hits, p.limit or 40) do out[i] = hits[i] end
 	local by = {}
 	for _, h in ipairs(hits) do by[h.src] = (by[h.src] or 0) + 1 end
 	return { stat = p.stat, direction = dir, total = total, bySource = by, results = out,
-		note = "delta = change in stat when that mod line (max roll) is added to the current build; conditional mods may show 0 and be missing." }
+		note = "delta = change in stat when that mod line (max roll) is added to the current build. Hits with `requires` need those conditions: requirementsMetOnBuild=true means they already hold on this build as configured, otherwise the delta assumes them (pass conditional=false to exclude those). Lines PoB can't parse are never found here; use search for those." }
 end
 
 function methods.effect_stats(p)
 	loadEffects()
-	local c, noeff, errs = 0, 0, 0
+	local c, noeff, errs, unsupported, conditional = 0, 0, 0, 0, 0
 	local statCounts = {}
 	for k, v in pairs(effects) do
 		c = c + 1
-		if v.n == 0 then noeff = noeff + 1 end
+		if v.unsupported then unsupported = unsupported + 1
+		elseif v.n == 0 and (v.nm or 0) == 0 then noeff = noeff + 1 end
 		if v.err then errs = errs + 1 end
-		for s in pairs(v.d) do statCounts[s] = (statCounts[s] or 0) + 1 end
+		if v.dm then conditional = conditional + 1 end
+		local moved = {}
+		for s in pairs(v.d or {}) do moved[s] = true end
+		for s in pairs(v.dm or {}) do moved[s] = true end
+		for s in pairs(moved) do statCounts[s] = (statCounts[s] or 0) + 1 end
 	end
-	return { probed = c, noEffect = noeff, errors = errs, statsMoved = statCounts }
+	return { probed = c, unsupportedByParser = unsupported, conditional = conditional, noEffect = noeff, errors = errs,
+		statsMoved = statCounts }
 end
 
 -- Chat: the in-app Agent tab queues user messages here; an external agent long-polls chat_wait and answers
@@ -512,14 +993,16 @@ end
 function M.poll()
 	if not server then return end
 	keepAwake()
-	if userIdle() then
+	local flushing = false
+	for _, cl in ipairs(clients) do if #cl.out > 0 then flushing = true end end
+	if userIdle() and not flushing then
 		-- Block briefly instead of rendering at full rate; wakes immediately on a connection or data.
 		local socks = { server }
 		for _, cl in ipairs(clients) do socks[#socks + 1] = cl.sock end
 		require("socket").select(socks, nil, 0.25)
 	end
 	local c = server:accept()
-	if c then c:settimeout(0) clients[#clients + 1] = { sock = c, buf = "" } end
+	if c then c:settimeout(0) clients[#clients + 1] = { sock = c, buf = "", out = "" } end
 	local waiting = 0
 	for i = #clients, 1, -1 do
 		local cl = clients[i]
@@ -550,8 +1033,14 @@ function M.poll()
 			end
 			if resp then
 				local okj, s = pcall(json.encode, resp)
-				cl.sock:send((okj and s or '{"error":"encode failed"}') .. "\n")
+				cl.out = cl.out .. (okj and s or '{"error":"encode failed"}') .. "\n"
 			end
+		end
+		-- Non-blocking send may write only part of a large response; keep the rest for the next frame
+		if #cl.out > 0 and err ~= "closed" then
+			local sent, serr, lastSent = cl.sock:send(cl.out)
+			cl.out = cl.out:sub((sent or lastSent or 0) + 1)
+			if serr == "closed" then err = "closed" end
 		end
 		if err == "closed" then cl.sock:close() table.remove(clients, i) end
 	end

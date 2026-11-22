@@ -16942,20 +16942,20 @@ c["Grants Immunity to Chill for 16 seconds if used while Chilled Grants Immunity
 c["Grants Immunity to Chill for 4 seconds if used while Chilled Grants Immunity to Freeze for 4 seconds if used while Frozen"]={nil,"Grants Immunity to Chill for 4 seconds if used while Chilled Grants Immunity to Freeze for 4 seconds if used while Frozen "}
 c["Grants Immunity to Chill for 7 seconds if used while Chilled Grants Immunity to Freeze for 7 seconds if used while Frozen"]={nil,"Grants Immunity to Chill for 7 seconds if used while Chilled Grants Immunity to Freeze for 7 seconds if used while Frozen "}
 c["Grants Immunity to Corrupted Blood for 12 seconds if used while affected by Corrupted Blood"]={{[1]={[1]={type="Condition",var="UsingFlask"},flags=0,keywordFlags=0,name="CorruptedBloodImmune",type="FLAG",value=true}},nil}
-c["Grants Immunity to Hinder for 10 seconds if used while Hindered"]={nil,"Grants Immunity to Hinder for 10 seconds if used while Hindered "}
-c["Grants Immunity to Hinder for 13 seconds if used while Hindered"]={nil,"Grants Immunity to Hinder for 13 seconds if used while Hindered "}
-c["Grants Immunity to Hinder for 16 seconds if used while Hindered"]={nil,"Grants Immunity to Hinder for 16 seconds if used while Hindered "}
-c["Grants Immunity to Hinder for 7 seconds if used while Hindered"]={nil,"Grants Immunity to Hinder for 7 seconds if used while Hindered "}
+c["Grants Immunity to Hinder for 10 seconds if used while Hindered"]={{[1]={[1]={type="Condition",var="UsingFlask"},flags=0,keywordFlags=0,name="HinderImmune",type="FLAG",value=true}},nil}
+c["Grants Immunity to Hinder for 13 seconds if used while Hindered"]={{[1]={[1]={type="Condition",var="UsingFlask"},flags=0,keywordFlags=0,name="HinderImmune",type="FLAG",value=true}},nil}
+c["Grants Immunity to Hinder for 16 seconds if used while Hindered"]={{[1]={[1]={type="Condition",var="UsingFlask"},flags=0,keywordFlags=0,name="HinderImmune",type="FLAG",value=true}},nil}
+c["Grants Immunity to Hinder for 7 seconds if used while Hindered"]={{[1]={[1]={type="Condition",var="UsingFlask"},flags=0,keywordFlags=0,name="HinderImmune",type="FLAG",value=true}},nil}
 c["Grants Immunity to Ignite for 10 seconds if used while Ignited Removes all Burning when used"]={nil,"Grants Immunity to Ignite for 10 seconds if used while Ignited Removes all Burning when used "}
 c["Grants Immunity to Ignite for 13 seconds if used while Ignited Removes all Burning when used"]={nil,"Grants Immunity to Ignite for 13 seconds if used while Ignited Removes all Burning when used "}
 c["Grants Immunity to Ignite for 16 seconds if used while Ignited Removes all Burning when used"]={nil,"Grants Immunity to Ignite for 16 seconds if used while Ignited Removes all Burning when used "}
 c["Grants Immunity to Ignite for 4 seconds if used while Ignited"]={{[1]={[1]={type="Condition",var="UsingFlask"},flags=0,keywordFlags=0,name="IgniteImmune",type="FLAG",value=true}},nil}
 c["Grants Immunity to Ignite for 4 seconds if used while Ignited Removes all Burning when used"]={nil,"Grants Immunity to Ignite for 4 seconds if used while Ignited Removes all Burning when used "}
 c["Grants Immunity to Ignite for 7 seconds if used while Ignited Removes all Burning when used"]={nil,"Grants Immunity to Ignite for 7 seconds if used while Ignited Removes all Burning when used "}
-c["Grants Immunity to Maim for 10 seconds if used while Maimed"]={nil,"Grants Immunity to Maim for 10 seconds if used while Maimed "}
-c["Grants Immunity to Maim for 13 seconds if used while Maimed"]={nil,"Grants Immunity to Maim for 13 seconds if used while Maimed "}
-c["Grants Immunity to Maim for 16 seconds if used while Maimed"]={nil,"Grants Immunity to Maim for 16 seconds if used while Maimed "}
-c["Grants Immunity to Maim for 7 seconds if used while Maimed"]={nil,"Grants Immunity to Maim for 7 seconds if used while Maimed "}
+c["Grants Immunity to Maim for 10 seconds if used while Maimed"]={{[1]={[1]={type="Condition",var="UsingFlask"},flags=0,keywordFlags=0,name="MaimImmune",type="FLAG",value=true}},nil}
+c["Grants Immunity to Maim for 13 seconds if used while Maimed"]={{[1]={[1]={type="Condition",var="UsingFlask"},flags=0,keywordFlags=0,name="MaimImmune",type="FLAG",value=true}},nil}
+c["Grants Immunity to Maim for 16 seconds if used while Maimed"]={{[1]={[1]={type="Condition",var="UsingFlask"},flags=0,keywordFlags=0,name="MaimImmune",type="FLAG",value=true}},nil}
+c["Grants Immunity to Maim for 7 seconds if used while Maimed"]={{[1]={[1]={type="Condition",var="UsingFlask"},flags=0,keywordFlags=0,name="MaimImmune",type="FLAG",value=true}},nil}
 c["Grants Immunity to Poison for 10 seconds if used while Poisoned"]={{[1]={[1]={type="Condition",var="UsingFlask"},flags=0,keywordFlags=0,name="PoisonImmune",type="FLAG",value=true}},nil}
 c["Grants Immunity to Poison for 13 seconds if used while Poisoned"]={{[1]={[1]={type="Condition",var="UsingFlask"},flags=0,keywordFlags=0,name="PoisonImmune",type="FLAG",value=true}},nil}
 c["Grants Immunity to Poison for 16 seconds if used while Poisoned"]={{[1]={[1]={type="Condition",var="UsingFlask"},flags=0,keywordFlags=0,name="PoisonImmune",type="FLAG",value=true}},nil}

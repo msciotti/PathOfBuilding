@@ -3,6 +3,7 @@
 local M = {}
 
 local function lower(s) return (s or ""):lower() end
+local m_max = math.max
 
 local function addEntry(idx, e)
 	e.hay = lower(table.concat(e.lines, "\n") .. "\n" .. (e.name or "") .. "\n" .. table.concat(e.tags or {}, " "))
@@ -52,20 +53,52 @@ function M.build(data, tree)
 	end
 
 	if tree and tree.nodes then
+		local masteriesSeen = {}
 		for id, n in pairs(tree.nodes) do
-			if n.sd and #n.sd > 0 and n.type ~= "ClassStart" then
+			if n.ascendancyName and n.sd and #n.sd > 0 then
+				-- Ascendancy nodes get their own source so they can be filtered (passive:ascendancy:Gladiator)
 				addEntry(idx, {
-					src = "passive:" .. (n.type or "Normal"):lower(), id = tostring(id), name = n.dn,
+					src = "passive:ascendancy:" .. n.ascendancyName, id = tostring(id), name = n.dn,
 					kind = n.type, lines = n.sd, ascendancy = n.ascendancyName,
 				})
+			elseif n.sd and #n.sd > 0 and n.type ~= "ClassStart" then
+				addEntry(idx, {
+					src = "passive:" .. (n.type or "Normal"):lower(), id = tostring(id), name = n.dn,
+					kind = n.type, lines = n.sd,
+				})
+			end
+			-- Mastery nodes carry no sd; their selectable effects live in tree.masteryEffects
+			for _, fx in ipairs(n.masteryEffects or {}) do
+				local effect = tree.masteryEffects and tree.masteryEffects[fx.effect]
+				if effect and not masteriesSeen[fx.effect] then
+					masteriesSeen[fx.effect] = true
+					addEntry(idx, { src = "passive:mastery", id = tostring(fx.effect), name = n.dn, lines = effect.sd })
+				end
+			end
+		end
+		for _, n in pairs(tree.tattoo and tree.tattoo.nodes or {}) do
+			if n.sd and #n.sd > 0 and n.dn and n.dn ~= "" then
+				addEntry(idx, { src = "tattoo", id = n.id, name = n.dn, kind = n.targetType, lines = n.sd })
+			end
+		end
+		for _, n in pairs(tree.legion and tree.legion.nodes or {}) do
+			if n.sd and #n.sd > 0 then
+				addEntry(idx, { src = "timeless", id = tostring(n.id), name = n.dn, kind = n.ks and "Keystone" or n["not"] and "Notable" or nil, lines = n.sd })
 			end
 		end
 	end
 
-	local metaPrefix = { "League:", "Source:", "Variant:", "Requires", "Implicits:", "LevelReq:", "Has Alt", "Selected Variant", "Item Class:", "Rarity:", "Limited to:", "Radius:", "Upgrade:", "Sockets:", "Talisman Tier:" }
+	local metaPrefix = { "League:", "Source:", "Variant:", "Requires", "Implicits:", "LevelReq:", "Has Alt", "Selected Variant", "Selected Alt Variant", "Item Class:", "Rarity:", "Limited to:", "Radius:", "Upgrade:", "Sockets:", "Talisman Tier:" }
 	local function isMeta(l)
 		for _, p in ipairs(metaPrefix) do if l:sub(1, #p) == p then return true end end
 		return false
+	end
+	local function maxRoll(l)
+		return (l:gsub("%((%-?[%d%.]+)%-(%-?[%d%.]+)%)", "%2"))
+	end
+	local function parses(l)
+		local mods, extra = modLib.parseMod(maxRoll(l))
+		return mods ~= nil and not extra
 	end
 	for typeName, list in pairs(data.uniques or {}) do
 		for _, raw in ipairs(list) do
@@ -73,35 +106,136 @@ function M.build(data, tree)
 			for l in raw:gmatch("[^\r\n]+") do all[#all + 1] = l end
 			local name = table.remove(all, 1)
 			local base = table.remove(all, 1)
+			if name and name:sub(1, 7) == "Rarity:" then
+				name = base
+				base = table.remove(all, 1)
+			end
+			-- Variants named "Pre x.y" are legacy versions; drop lines that only apply to those
+			local legacy, variantCount = {}, 0
+			for _, l in ipairs(all) do
+				local v = l:match("^Variant: (.*)")
+				if v then
+					variantCount = variantCount + 1
+					legacy[variantCount] = v:match("^Pre ") ~= nil
+				end
+			end
 			local lines = {}
 			for _, l in ipairs(all) do
 				if not isMeta(l) then
-					l = l:gsub("^{[^}]*}", ""):gsub("^{[^}]*}", "")
-					lines[#lines + 1] = l
+					local variants = l:match("{variant:([%d,]+)}")
+					local current = true
+					if variants then
+						current = false
+						for v in variants:gmatch("%d+") do
+							if not legacy[tonumber(v)] then current = true break end
+						end
+					end
+					if current then
+						local n
+						repeat l, n = l:gsub("^{[^}]*}", "") until n == 0
+						lines[#lines + 1] = l
+					end
 				end
+			end
+			-- Rejoin stat lines that wrap onto the next line, as PoB does when parsing items
+			local joined, i = {}, 1
+			while i <= #lines do
+				local l = lines[i]
+				if lines[i + 1] and not parses(l) and parses(l .. " " .. lines[i + 1]) then
+					l = l .. " " .. lines[i + 1]
+					i = i + 1
+				end
+				joined[#joined + 1] = l
+				i = i + 1
 			end
 			if name and name ~= "" and name:sub(1, 11) ~= "Item Class:" then
-				addEntry(idx, { src = "unique:" .. typeName, id = name, name = name, kind = base and base:gsub("^{[^}]*}", ""), lines = lines })
+				addEntry(idx, { src = "unique:" .. typeName, id = name, name = name, kind = base and base:gsub("^{[^}]*}", ""), lines = joined })
 			end
 		end
 	end
 
-	for slot, enchs in pairs(data.enchantments or {}) do
-		for kind, lst in pairs(enchs) do
-			if type(lst) == "table" then
-				for i, e in ipairs(lst) do
-					local text = type(e) == "table" and table.concat(e, "/") or tostring(e)
-					addEntry(idx, { src = "enchant:" .. slot, id = kind .. "#" .. i, name = kind, lines = { text } })
-				end
+	-- Enchant tables nest differently per slot (helmet: skill -> MERCILESS/ENDGAME -> lines; weapon: type -> list of
+	-- {lines..., types = {weapon types}}). Walk only the source tables: Data.lua also copies the weapon table into one
+	-- table per weapon type and aliases Flask, which would duplicate every weapon enchant ~17 times.
+	local function walkEnchants(slot, kind, t, depth)
+		if depth > 4 then return end
+		if type(t[1]) == "string" then
+			for i, text in ipairs(t) do
+				addEntry(idx, { src = "enchant:" .. slot, id = (kind or "?") .. "#" .. i, name = kind, lines = { text } })
 			end
+			return
+		end
+		if type(t[1]) == "table" and type(t[1][1]) == "string" then
+			for i, item in ipairs(t) do
+				local lines, slots = {}, {}
+				for _, l in ipairs(item) do lines[#lines + 1] = l end
+				for ty in pairs(item.types or {}) do slots[#slots + 1] = ty end
+				table.sort(slots)
+				addEntry(idx, { src = "enchant:" .. slot, id = (kind or "?") .. "#" .. i, name = kind, lines = lines, spawnOn = #slots > 0 and slots or nil })
+			end
+			return
+		end
+		for k, v in pairs(t) do
+			if type(v) == "table" then walkEnchants(slot, type(k) == "string" and (kind and kind .. " " .. k or k) or kind, v, depth + 1) end
+		end
+	end
+	for _, slot in ipairs({ "Helmet", "Boots", "Gloves", "Belt", "Body Armour", "Weapon", "UtilityFlask" }) do
+		local enchs = data.enchantments and data.enchantments[slot]
+		if type(enchs) == "table" then walkEnchants(slot, nil, enchs, 0) end
+	end
+
+	for i, m in ipairs(data.masterMods or {}) do
+		local slots = {}
+		for slot in pairs(m.types or {}) do slots[#slots + 1] = slot end
+		table.sort(slots)
+		addEntry(idx, { src = "mod:Crafted", id = "craft#" .. i, name = m.affix, kind = m.type, level = m.level,
+			lines = modLines(m), tags = m.modTags, spawnOn = slots, group = m.group })
+	end
+
+	for name, base in pairs(data.itemBases or {}) do
+		local lines = {}
+		if base.implicit then
+			for l in base.implicit:gmatch("[^\n]+") do lines[#lines + 1] = l end
+		end
+		for _, l in ipairs(base.flask and base.flask.buff or {}) do lines[#lines + 1] = l end
+		if #lines > 0 then
+			addEntry(idx, { src = "base:" .. (base.type or "Other"):lower(), id = name, name = name, kind = base.subType, lines = lines })
 		end
 	end
 
+	for godId, god in pairs(data.pantheons or {}) do
+		for i, soul in ipairs(god.souls or {}) do
+			local lines = {}
+			for _, m in ipairs(soul.mods or {}) do lines[#lines + 1] = m.line end
+			addEntry(idx, { src = "pantheon:" .. (god.isMajorGod and "major" or "minor"), id = godId .. "#" .. i,
+				name = soul.name, kind = i == 1 and "Base" or "Upgrade", lines = lines })
+		end
+	end
+
+	-- Essence mods are stored per item class as mod ids; resolve them to their text. Lines stay plain mod text
+	-- (so what_if/the effect index can use them) and `slots` records which item classes give which line.
+	local allMods = data.itemMods.Item or {}
 	for id, e in pairs(data.essences or {}) do
 		if type(e) == "table" then
-			local lines = {}
-			for slot, text in pairs(e.mods or {}) do lines[#lines + 1] = slot .. ": " .. tostring(text) end
-			addEntry(idx, { src = "essence", id = tostring(id), name = e.name, lines = lines })
+			local lines, slots, seen = {}, {}, {}
+			for slot, modId in pairs(e.mods or {}) do
+				local m = allMods[modId]
+				for _, text in ipairs(m and modLines(m) or { tostring(modId) }) do
+					if not seen[text] then
+						seen[text] = true
+						lines[#lines + 1] = text
+						slots[text] = {}
+					end
+					table.insert(slots[text], slot)
+				end
+			end
+			table.sort(lines)
+			local spawnOn = {}
+			for _, text in ipairs(lines) do
+				table.sort(slots[text])
+				spawnOn[#spawnOn + 1] = text .. " <- " .. table.concat(slots[text], ", ")
+			end
+			addEntry(idx, { src = "essence", id = tostring(id), name = e.name, lines = lines, essenceSlots = spawnOn })
 		end
 	end
 
@@ -133,7 +267,21 @@ local SYN = {
 	speed = { "speed" }, regen = { "regenerat" }, leech = { "leech" },
 	poison = { "poison" }, bleed = { "bleed" }, ignite = { "ignite", "burn" }, shock = { "shock" },
 	freeze = { "freez", "frozen" }, chill = { "chill" }, stun = { "stun" }, curse = { "curse", "hex" },
+	ms = { "movement speed" }, movespeed = { "movement speed" }, es = { "energy shield" },
+	res = { "resistance" }, resists = { "resistance" }, resist = { "resist" }, phys = { "physical" },
+	ele = { "elemental" }, regen = { "regenerat" }, suppression = { "suppress" }, pdr = { "physical damage reduction" },
+	charges = { "charge" }, reservation = { "reserv" }, fortify = { "fortif" },
+	pen = { "penetrat" }, penetration = { "penetrat" }, multi = { "multiplier" },
+	aoe = { "area of effect" }, cdr = { "cooldown recovery" },
+	dps = { "damage" }, aps = { "attack speed" }, cps = { "cast speed" }, inc = { "increased" },
+	dot = { "damage over time" }, exposure = { "expos" }, conversion = { "converted to", "as extra" },
 }
+-- Short terms ("ms", "max") must start a word, otherwise they hit inside most words ("totems")
+local function has(text, a)
+	if #a <= 3 and a:match("^%w+$") then return text:find("%f[%w]" .. a) ~= nil end
+	return text:find(a, 1, true) ~= nil
+end
+
 local function expand(term)
 	local alts = SYN[term]
 	if alts then return alts end
@@ -146,8 +294,11 @@ function M.search(idx, query, opts)
 	opts = opts or {}
 	local terms = {}
 	for t in lower(query):gmatch("%S+") do terms[#terms + 1] = opts.exact and { t } or expand(t) end
-	local res, total = {}, 0
+	local hits, total = {}, 0
 	local bySource = {}
+	local phrase = lower(query)
+	local wantsMinion = phrase:find("minion", 1, true) ~= nil
+	local wantsPresence = phrase:find("presence", 1, true) ~= nil
 	for _, e in ipairs(idx.list) do
 		local ok = true
 		if opts.sources then
@@ -162,22 +313,71 @@ function M.search(idx, query, opts)
 				if s == opts.slot then ok = true break end
 			end
 		end
-		if ok then
+		local function allTerms(text)
 			for _, alts in ipairs(terms) do
 				local hit = false
 				for _, a in ipairs(alts) do
-					if e.hay:find(a, 1, true) then hit = true break end
+					if has(text, a) then hit = true break end
 				end
-				if not hit then ok = false break end
+				if not hit then return false end
+			end
+			return true
+		end
+		if ok then ok = allTerms(e.hay) end
+		if ok and not allTerms(lower(e.name)) then
+			-- Every term must match within one line (or the name), not scattered across unrelated lines
+			ok = false
+			for _, l in ipairs(e.lines) do
+				if allTerms(l:lower()) then ok = true break end
 			end
 		end
 		if ok then
 			total = total + 1
 			bySource[e.src] = (bySource[e.src] or 0) + 1
-			if #res < (opts.limit or 50) then res[#res + 1] = e end
+			-- Relevance: the literal query inside one line, then all terms inside one line, then shorter entries.
+			-- Minion lines sink unless the query asks for minions.
+			local score = 0
+			for _, l in ipairs(e.lines) do
+				local ll = l:lower()
+				if has(ll, phrase) then score = m_max(score, 3) end
+				local n = 0
+				for _, alts in ipairs(terms) do
+					for _, a in ipairs(alts) do
+						if has(ll, a) then n = n + 1 break end
+					end
+				end
+				if n == #terms then score = m_max(score, 2) end
+			end
+			if not wantsMinion and e.hay:find("minion", 1, true) then score = score - 2 end
+			if not wantsPresence and e.hay:find("in your presence", 1, true) then score = score - 2 end
+			hits[#hits + 1] = { e = e, score = score, n = #e.lines, i = #hits }
 		end
 	end
-	return res, total, bySource
+	table.sort(hits, function(a, b)
+		if a.score ~= b.score then return a.score > b.score end
+		if a.n ~= b.n then return a.n < b.n end
+		return a.i < b.i
+	end)
+	local res = {}
+	for i = 1, math.min(#hits, opts.limit or 50) do res[i] = hits[i].e end
+	return res, total, bySource, terms
+end
+
+-- Lines of an entry that match the query. Search ANDs terms across the whole entry, so on long entries like
+-- variant uniques these are the lines that actually matter: lines matching every term, else any term.
+function M.matchedLines(e, terms)
+	local all, any = {}, {}
+	for _, l in ipairs(e.lines) do
+		local ll, n = l:lower(), 0
+		for _, alts in ipairs(terms) do
+			for _, a in ipairs(alts) do
+				if has(ll, a) then n = n + 1 break end
+			end
+		end
+		if n == #terms then all[#all + 1] = l end
+		if n > 0 then any[#any + 1] = l end
+	end
+	return #all > 0 and all or any
 end
 
 return M
