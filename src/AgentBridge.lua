@@ -1089,6 +1089,71 @@ function methods.effect_stats(p)
 		statsMoved = statCounts }
 end
 
+function methods.gem_what_if(p)
+	local b = env().build
+	if not b then return { error = "no build loaded" } end
+	local group = b.skillsTab.socketGroupList[p.group or b.mainSocketGroup]
+	if not group then return { error = "no such socket group" } end
+	local base, baseComponents = currentStats(b)
+	local want
+	if p.stats then want = {} for _, k in ipairs(p.stats) do want[k] = true end end
+	local count, saved, used = #group.gemList, {}, {}
+	for i, g in ipairs(group.gemList) do saved[i] = { level = g.level, quality = g.quality } end
+	local function restore()
+		for i = #group.gemList, count + 1, -1 do table.remove(group.gemList, i) end
+		for i, s in ipairs(saved) do
+			group.gemList[i].level, group.gemList[i].quality = s.level, s.quality
+		end
+		b.skillsTab:ProcessSocketGroup(group)
+	end
+	for _, c in ipairs(p.gems or {}) do
+		local gem
+		for _, g in ipairs(group.gemList) do
+			if g.nameSpec:lower() == c.name:lower() then gem = g break end
+		end
+		local was = gem and { level = gem.level, quality = gem.quality }
+		if not gem then
+			gem = { nameSpec = c.name, enabled = true, enableGlobal1 = true, enableGlobal2 = true, count = 1, qualityId = "Default" }
+			table.insert(group.gemList, gem)
+		end
+		gem.level, gem.quality = c.level or 1, c.quality or 20
+		used[#used + 1] = { gem = gem, was = was }
+		b.skillsTab:ProcessSocketGroup(group)
+		if gem.errMsg then
+			local err = gem.errMsg
+			restore()
+			return { error = c.name .. ": " .. err }
+		end
+		if not c.level then
+			gem.level = gem.gemData.naturalMaxLevel
+			b.skillsTab:ProcessSocketGroup(group)
+		end
+	end
+	local ok, after = pcall(recalc, b)
+	local components
+	if ok then
+		local okT, total, comps = pcall(skillTotal, b)
+		if okT then after.SkillTotalDPS, components = total, comps else ok, after = false, total end
+	end
+	local gems = {}
+	for _, u in ipairs(used) do
+		local max = u.gem.gemData.naturalMaxLevel
+		gems[#gems + 1] = { name = u.gem.nameSpec, action = u.was and "set" or "added", level = u.gem.level, quality = u.gem.quality,
+			naturalMaxLevel = max, needsCorruption = (u.gem.level > max or u.gem.quality > 20) or nil, was = u.was }
+	end
+	restore()
+	local restored = pcall(recalc, b)
+	if not ok then return { error = tostring(after) } end
+	local skillParts
+	if baseComponents and components then
+		skillParts = { combined = true, components = {} }
+		for i, c in ipairs(baseComponents) do
+			skillParts.components[i] = { part = c.part, name = c.name, before = c.dps, after = components[i].dps }
+		end
+	end
+	return { gems = gems, changed = diffStats(base, after, want), skillTotal = skillParts, restored = restored }
+end
+
 function methods.import_character(p)
 	local main = env().main
 	if not main then return { error = "PoB not ready" } end
