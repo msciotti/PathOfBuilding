@@ -26,8 +26,8 @@ chat_status, chat_history`. The agent's tools and their parameters are in `agent
   the block. When a mod's requirements aren't met as configured, `ifConditionsMet` recalculates with them forced on.
 - `design_rare` builds an item through `Item:Craft` (Prefix/Suffix lines with `{range}`, bench mods as `{crafted}` lines),
   checking each mod with `Item:CanHaveMod` and the item's affix limits, and returns the `BuildRaw` text plus a
-  `trade_search`-shaped `tradeQuery`. `fill_resists` measures the resist gaps with the bare bases equipped, places
-  resist mods, spends the rest, and evaluates the result with the same `variantRow` as `compare_variants`.
+  `trade_search`-shaped `tradeQuery`. `fill_resists` measures the resist gaps with the bare bases equipped,
+  picks implicit variants and resist mods across the slots, spends the rest, and evaluates the result with the same `variantRow` as `compare_variants`.
 - `rank_options` runs `what_if` on every search hit and ranks by a weighted relative change of the goal stats.
 - `find_by_effect` uses the effect index: each distinct mod line probed once, keyed by the output stats it moves.
 - `chat_wait` holds the connection open until the panel has a message; the agent loop is

@@ -1644,12 +1644,26 @@ local function newRare(spec, ilvl)
 	lines[#lines + 1] = "Crafted: true"
 	lines[#lines + 1] = "Item Level: " .. ilvl
 	local implicits = {}
-	for l in (entry.implicit or ""):gmatch("[^\n]+") do implicits[#implicits + 1] = l end
+	for l in (spec.implicit or entry.implicit or ""):gmatch("[^\n]+") do implicits[#implicits + 1] = l end
 	lines[#lines + 1] = "Implicits: " .. #implicits
 	for _, l in ipairs(implicits) do lines[#lines + 1] = l end
 	local item = new("Item"):Item(table.concat(lines, "\n"))
 	if not item.base or not item.affixes then return nil, "can't build " .. baseName end
 	return item
+end
+
+-- Implicit lines of the bases that differ only in implicit (Two-Stone Ring comes with three resist pairs)
+local function implicitVariants(baseName)
+	local entry, family = data.itemBases[baseName], baseName:gsub(" %(.-%)$", "")
+	local out, seen = {}, {}
+	for name, other in pairs(data.itemBases) do
+		if name:gsub(" %(.-%)$", "") == family and other.subType == entry.subType and other.implicit and not seen[other.implicit] then
+			seen[other.implicit] = true
+			out[#out + 1] = other.implicit
+		end
+	end
+	table.sort(out)
+	return out
 end
 
 local function newContext(spec)
@@ -1825,6 +1839,10 @@ function methods.design_rare(p)
 	local b = env().build
 	local ctx, err = newContext(p)
 	if not ctx then return { error = err } end
+	if p.implicit then
+		local variants = implicitVariants(ctx.item.baseName)
+		if not isValueInArray(variants, p.implicit) then return { error = "implicit must be one of: " .. table.concat(variants, "; ") } end
+	end
 	if p.slot then
 		if not b then return { error = "no build loaded" } end
 		local bad = slotCheck(b, p.slot, ctx)
@@ -1881,12 +1899,66 @@ local function equipChanges(items)
 	return changes
 end
 
+local ELEMENTS = { "Fire", "Cold", "Lightning" }
+
+-- Resistance an implicit line gives at its mid roll, per element.
+local function implicitResists(line)
+	local out = { Fire = 0, Cold = 0, Lightning = 0 }
+	local value = tonumber(itemLib.applyRange(line, 0.5):match("%-?%d+%.?%d*"))
+	if not value or not line:find("Resistance") then return out end
+	for _, elem in ipairs(ELEMENTS) do
+		if line:find(elem) or line:find("all Elemental") then out[elem] = value end
+	end
+	return out
+end
+
+local function spendFor(p, ctx)
+	if p.spend then return p.spend end
+	local spend = { "+# to maximum Life", "+# to Strength" }
+	if ctx.item.type == "Boots" then table.insert(spend, 1, "#% increased Movement Speed") end
+	return spend
+end
+
+-- Places resist suffixes across all states at once, most open slot first. `sparing` keeps each item's spend suffixes
+-- free. Nothing in `states` is changed; returns the picks per state and the resistance left uncovered.
+local function planResists(states, gaps, sparing)
+	local plan, left = {}, {}
+	for i, state in ipairs(states) do
+		plan[i] = { picks = {}, used = {}, suffixes = 0 }
+	end
+	for elem, gap in pairs(gaps) do left[elem] = gap end
+	for _, elem in ipairs(ELEMENTS) do
+		while left[elem] > 0 do
+			local best
+			for i, state in ipairs(states) do
+				local room = state.ctx.limit.Suffix - plan[i].suffixes - (sparing and state.reserve or 0)
+				local tiers = room > 0 and state.tiers[elem] or nil
+				if tiers and not plan[i].used[tiers[1].mod.group] and (not best or room > best.room) then best = { i = i, room = room, tiers = tiers } end
+			end
+			if not best then break end
+			local list = allowedTiers(best.tiers)
+			local pick = math.min(PROPOSAL_TIER, #list)
+			-- Tier 2 unless only a small remainder is left, which a lower tier covers
+			for i = pick, #list do
+				if rolledValue(list[i].mod, PROPOSAL_ROLL) >= left[elem] then pick = i end
+			end
+			left[elem] = left[elem] - rolledValue(list[pick].mod, PROPOSAL_ROLL)
+			local entry = plan[best.i]
+			entry.picks[#entry.picks + 1] = { id = list[pick].id, mod = list[pick].mod, tier = list[pick].tier, tiers = #best.tiers, range = PROPOSAL_ROLL }
+			entry.used[list[pick].mod.group] = true
+			entry.suffixes = entry.suffixes + 1
+		end
+	end
+	local short = 0
+	for _, g in pairs(left) do short = short + math.max(g, 0) end
+	return plan, short
+end
+
 function methods.fill_resists(p)
 	local b = env().build
 	if not b then return { error = "no build loaded" } end
 	if type(p.slots) ~= "table" or #p.slots == 0 then return { error = "slots required" } end
 	if #p.slots > MAX_FILL_SLOTS then return { error = "at most " .. MAX_FILL_SLOTS .. " slots" } end
-	local spend = p.spend or { "+# to maximum Life", "+# to Strength" }
 	local states, bare = {}, {}
 	for i, slotName in ipairs(p.slots) do
 		local slot = b.itemsTab.slots[slotName]
@@ -1898,13 +1970,20 @@ function methods.fill_resists(p)
 		if not ctx then return { error = slotName .. ": " .. err } end
 		local bad = slotCheck(b, slotName, ctx)
 		if bad then return { error = bad } end
-		-- Suffixes the spend stats will need, kept free while resists are placed
-		local reserve = 0
-		for _, text in ipairs(spend) do
-			local tiers = findTiers(ctx, requestTemplate(text))
-			if tiers and tiers[1].mod.type == "Suffix" then reserve = reserve + 1 end
+		local variants = implicitVariants(ctx.item.baseName)
+		-- Start from the implicit the slot has now, if it is one of the base's variants
+		local currentImplicit = current and current.baseName == ctx.item.baseName and current.implicitModLines[1] and current.implicitModLines[1].line
+		for _, v in ipairs(variants) do
+			if v == currentImplicit then ctx.spec.implicit = v end
 		end
-		states[i] = { slot = slotName, ctx = ctx, picks = {}, used = {}, count = { Prefix = 0, Suffix = 0 }, reserve = reserve }
+		ctx.spec.implicit = ctx.spec.implicit or variants[1]
+		local state = { slot = slotName, ctx = ctx, variants = variants, spend = spendFor(p, ctx), tiers = {}, reserve = 0 }
+		for _, elem in ipairs(ELEMENTS) do state.tiers[elem] = findTiers(ctx, requestTemplate(RESIST_TEXT[elem])) end
+		for _, text in ipairs(state.spend) do
+			local tiers = findTiers(ctx, requestTemplate(text))
+			if tiers and tiers[1].mod.type == "Suffix" then state.reserve = state.reserve + 1 end
+		end
+		states[i] = state
 		bare[i] = { slot = slotName, item = buildDesign(ctx, {}).item }
 	end
 	local want = p.stats or VARIANT_STATS
@@ -1912,66 +1991,80 @@ function methods.fill_resists(p)
 	local open = variantRow(b, { name = "bare bases", changes = equipChanges(bare) }, want)
 	if before.error or open.error then return { error = before.error or open.error } end
 
-	local function add(state, tiers, tier)
-		local pick = { id = tiers[tier].id, mod = tiers[tier].mod, tier = tier, tiers = #tiers, range = PROPOSAL_ROLL }
-		state.picks[#state.picks + 1] = pick
-		state.used[pick.mod.group] = true
-		state.count[pick.mod.type] = state.count[pick.mod.type] + 1
-	end
-	local gaps, warnings, notes = {}, {}, {}
-	for elem in pairs(RESIST_TEXT) do gaps[elem] = open.raw["Missing" .. elem .. "Resist"] or 0 end
-	-- The first pass leaves each item's Strength/life suffix free; the second uses it if the caps still aren't reached.
-	for _, sparing in ipairs({ true, false }) do
-		for _, elem in ipairs({ "Fire", "Cold", "Lightning" }) do
-			while gaps[elem] > 0 do
-				local best
-				for _, state in ipairs(states) do
-					local room = state.ctx.limit.Suffix - state.count.Suffix - (sparing and state.reserve or 0)
-					local tiers = room > 0 and findTiers(state.ctx, requestTemplate(RESIST_TEXT[elem])) or nil
-					if tiers and not state.used[tiers[1].mod.group] and (not best or room > best.room) then best = { state = state, room = room, tiers = tiers } end
-				end
-				if not best then break end
-				local list = allowedTiers(best.tiers)
-				local pick = math.min(PROPOSAL_TIER, #list)
-				-- The lowest tier that still covers the gap, but never better than the proposal tier
-				for i = pick, #list do
-					if rolledValue(list[i].mod, PROPOSAL_ROLL) >= gaps[elem] then pick = i end
-				end
-				gaps[elem] = gaps[elem] - rolledValue(list[pick].mod, PROPOSAL_ROLL)
-				add(best.state, best.tiers, list[pick].tier)
-			end
-		end
-	end
-	for elem, gap in pairs(gaps) do
-		if gap > 0 then warnings[#warnings + 1] = string.format("%s resistance is still %d short: every chosen slot is out of open suffixes", elem, gap) end
+	-- Resistance still needed with no implicit at all, so any combination of implicit variants can be tried
+	local gaps = {}
+	for _, elem in ipairs(ELEMENTS) do
+		gaps[elem] = -open.raw[elem .. "ResistOverCap"] + (open.raw["Missing" .. elem .. "Resist"] or 0)
 	end
 	for _, state in ipairs(states) do
-		for _, text in ipairs(spend) do
+		for elem, v in pairs(implicitResists(state.ctx.spec.implicit)) do gaps[elem] = gaps[elem] + v end
+	end
+	-- Best implicit variants: no resist short, then no spend stat given up, then the fewest resist mods
+	local best
+	local choice = {}
+	local function search(i)
+		if i > #states then
+			local g = {}
+			for elem, v in pairs(gaps) do g[elem] = v end
+			for _, line in ipairs(choice) do
+				for elem, v in pairs(implicitResists(line)) do g[elem] = g[elem] - v end
+			end
+			for _, sparing in ipairs({ true, false }) do
+				local plan, short = planResists(states, g, sparing)
+				local used = 0
+				for _, e in ipairs(plan) do used = used + #e.picks end
+				local score = { short, sparing and 0 or 1, used }
+				local better = not best
+				if best then
+					for k = 1, 3 do
+						if score[k] ~= best.score[k] then better = score[k] < best.score[k] break end
+					end
+				end
+				if better then best = { score = score, plan = plan, choice = { unpack(choice) } } end
+				if short == 0 then break end
+			end
+			return
+		end
+		for _, line in ipairs(states[i].variants) do
+			choice[i] = line
+			search(i + 1)
+		end
+	end
+	search(1)
+
+	local warnings, notes = {}, {}
+	if best.score[1] > 0 then warnings[#warnings + 1] = string.format("%d points of resistance can't be covered with the open suffixes", best.score[1]) end
+	local items = {}
+	for i, state in ipairs(states) do
+		state.ctx.spec.implicit = best.choice[i]
+		local picks, used, count = best.plan[i].picks, best.plan[i].used, { Prefix = 0, Suffix = #best.plan[i].picks }
+		for _, text in ipairs(state.spend) do
 			local tiers = findTiers(state.ctx, requestTemplate(text))
 			local list = tiers and allowedTiers(tiers) or {}
 			local first = list[1]
 			if not first then
 				notes[#notes + 1] = state.slot .. ": " .. text .. " can't roll here"
-			elseif state.used[first.mod.group] or state.count[first.mod.type] >= state.ctx.limit[first.mod.type] then
+			elseif used[first.mod.group] or count[first.mod.type] >= state.ctx.limit[first.mod.type] then
 				notes[#notes + 1] = state.slot .. ": no open " .. first.mod.type:lower() .. " for " .. text
 			else
-				add(state, tiers, list[math.min(PROPOSAL_TIER, #list)].tier)
+				local tier = list[math.min(PROPOSAL_TIER, #list)]
+				picks[#picks + 1] = { id = tier.id, mod = tier.mod, tier = tier.tier, tiers = #tiers, range = PROPOSAL_ROLL }
+				used[first.mod.group] = true
+				count[first.mod.type] = count[first.mod.type] + 1
 			end
 		end
-	end
-	local items = {}
-	for i, state in ipairs(states) do
-		local design = buildDesign(state.ctx, state.picks)
+		local design = buildDesign(state.ctx, picks)
 		design.slot = state.slot
+		design.implicit = best.choice[i]
 		design.change = { equip = { slot = state.slot, item = design.item } }
-		design.open = { prefixes = state.ctx.limit.Prefix - state.count.Prefix, suffixes = state.ctx.limit.Suffix - state.count.Suffix }
+		design.open = { prefixes = state.ctx.limit.Prefix - count.Prefix, suffixes = state.ctx.limit.Suffix - count.Suffix }
 		items[i] = design
 	end
 	local variant = { name = "fill_resists", changes = equipChanges(items) }
 	local after = variantRow(b, variant, want)
 	if after.error then return { error = after.error } end
 	local resists = {}
-	for elem in pairs(RESIST_TEXT) do
+	for _, elem in ipairs(ELEMENTS) do
 		local missing = after.raw["Missing" .. elem .. "Resist"] or 0
 		resists[elem] = { total = after.raw[elem .. "ResistTotal"], cap = after.raw[elem .. "ResistTotal"] - after.raw[elem .. "ResistOverCap"], capped = missing == 0 }
 		if missing > 0 then warnings[#warnings + 1] = string.format("%s resistance ends %d below its cap", elem, missing) end
