@@ -38,15 +38,32 @@ end
 function M.build(data, tree)
 	local idx = { list = {}, sources = {}, order = {} }
 
+	-- Vestigial mods come from one unique and can roll on any unique of the same item type (PoB's
+	-- AddImplicitPopup rule), so record the source unique and that type
+	local uniqueType = {}
+	for typeName, list in pairs(data.uniques or {}) do
+		for _, raw in ipairs(list) do
+			local name = raw:match("^%s*([^\r\n]+)")
+			if name then uniqueType[name] = typeName end
+		end
+	end
+
 	for srcName, mods in pairs(data.itemMods) do
 		if srcName ~= "Item" then
 			for id, m in pairs(mods) do
 				if type(m) == "table" then
-					addEntry(idx, {
+					local e = {
 						src = "mod:" .. srcName, id = id, name = m.affix ~= "" and m.affix or nil,
 						kind = m.type, level = m.level, lines = modLines(m),
 						tags = m.modTags, spawnOn = eligibleSlots(m), group = m.group,
-					})
+					}
+					local from = srcName == "Vestigial" and data.vestigialModMappings and data.vestigialModMappings[id]
+					if from then
+						e.name = "Vestigial implicit from " .. from
+						e.kind = "Vestigial"
+						e.spawnOn = uniqueType[from] and { "any unique " .. uniqueType[from] } or nil
+					end
+					addEntry(idx, e)
 				end
 			end
 		end

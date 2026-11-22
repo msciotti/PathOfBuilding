@@ -137,6 +137,30 @@ function methods.inspect(p)
 	return { path = p.path, value = project(v, p.depth or 2, {}, p.maxKeys or 80) }
 end
 
+-- Derived 0/1 stats: an ailment is effectively immune when it can't be applied (avoid chance 100) or it does
+-- nothing to you (Self<X>Effect or Self<X>Duration 0, e.g. "Unaffected by Poison"). Lets agents rank
+-- "how do I get poison immune" on one stat instead of two unrelated ones.
+local IMMUNE_AILMENTS = { "Poison", "Bleed", "Ignite", "Chill", "Freeze", "Shock", "Scorch", "Brittle", "Sap" }
+local function addDerived(out, t)
+	for _, a in ipairs(IMMUNE_AILMENTS) do
+		local avoid, effect, duration = out[a .. "AvoidChance"], out["Self" .. a .. "Effect"], out["Self" .. a .. "Duration"]
+		if avoid or effect then
+			local immune = (tonumber(avoid) or 0) >= 100 or tonumber(effect) == 0 or tonumber(duration) == 0
+			t[a .. "ImmuneEffective"] = immune and 1 or 0
+		end
+	end
+	return t
+end
+
+local function snapshot(out)
+	local t = {}
+	for k, v in pairs(out) do
+		if type(v) == "number" then t[k] = v
+		elseif type(v) == "boolean" then t[k] = v and 1 or 0 end
+	end
+	return addDerived(out, t)
+end
+
 local function mainSkillInfo(b)
 	local env_ = b.calcsTab and b.calcsTab.mainEnv
 	local skill = env_ and env_.player and env_.player.mainSkill
@@ -161,7 +185,7 @@ function methods.get_state()
 		class = b.spec and b.spec.curClassName, ascendancy = b.spec and b.spec.curAscendClassName,
 		level = b.characterLevel, mainSkill = mainSkillInfo(b),
 		dpsHint = "Use CombinedDPS (or TotalDPS for hits only) as a DPS goal. FullDPS is only set when skills are marked for Full DPS; PoisonDPS/BleedDPS are per stack, so use WithPoisonDPS/WithBleedDPS or CombinedDPS.",
-		stats = project(b.calcsTab and b.calcsTab.mainOutput or {}, 1, {}, 2000),
+		stats = snapshot(b.calcsTab and b.calcsTab.mainOutput or {}),
 	}
 end
 
@@ -176,25 +200,16 @@ function methods.list_stats(p)
 	end
 	local q = p.query and p.query:lower()
 	local out = {}
-	for k, v in pairs(b.calcsTab.mainOutput) do
-		local t = type(v)
-		if (t == "number" or t == "boolean") and (not q or k:lower():find(q, 1, true) or (labels[k] or ""):lower():find(q, 1, true)) then
-			out[#out + 1] = { stat = k, label = labels[k], value = t == "boolean" and (v and 1 or 0) or v }
+	for k, v in pairs(snapshot(b.calcsTab.mainOutput)) do
+		if not q or k:lower():find(q, 1, true) or (labels[k] or ""):lower():find(q, 1, true) then
+			out[#out + 1] = { stat = k, label = labels[k], value = v }
 		end
 	end
 	table.sort(out, function(a, b) return a.stat < b.stat end)
-	return { count = #out, stats = out, note = "Boolean outputs are shown as 0/1. Values are for the build as configured." }
+	return { count = #out, stats = out, note = "Boolean outputs are shown as 0/1. <Ailment>ImmuneEffective (agent-derived) is 1 when the ailment can't be applied (AvoidChance 100) or does nothing to you (Self<Ailment>Effect/Duration 0, e.g. Unaffected by Poison). Values are for the build as configured." }
 end
 
 -- Numeric outputs, plus boolean outputs as 0/1 (e.g. MaimImmunity) so diffs can see them.
-local function snapshot(out)
-	local t = {}
-	for k, v in pairs(out) do
-		if type(v) == "number" then t[k] = v
-		elseif type(v) == "boolean" then t[k] = v and 1 or 0 end
-	end
-	return t
-end
 
 -- Item text writes rolls as "(12-14)"; PoB resolves them before parsing, so do the same.
 local function resolveRanges(line, roll)
@@ -424,6 +439,15 @@ local function attackOnly(flags)
 	return false
 end
 
+-- The build with only the assumptions applied (socketed-gem mods are part of the tested mods, not assumptions)
+local function assumedBaseline(b, assume)
+	local only = {}
+	for _, m in ipairs(assume) do
+		if not m.raw then only[#only + 1] = m end
+	end
+	return evalMods(b, {}, only)
+end
+
 local function assumedNames(assume)
 	local names = {}
 	for _, m in ipairs(assume) do
@@ -523,8 +547,12 @@ function methods.what_if(p)
 	for _, q in ipairs(reqs) do if q.metOnBuild ~= true then needsAssume = true end end
 	if ok and #assume > 0 and p.assume ~= false and needsAssume then
 		local ok3, afterMet = evalMods(b, lines, assume)
-		if ok3 then
-			met = { assumed = assumedNames(assume), cannotForce = #unmet > 0 and unmet or nil, changed = diffStats(base, afterMet, want) }
+		-- Measure against the build with the same assumptions but without these mods, so forcing a condition
+		-- (e.g. activating the equipped flasks) isn't credited to the mod being tested
+		local okB, baseMet = assumedBaseline(b, assume)
+		if ok3 and okB then
+			met = { assumed = assumedNames(assume), cannotForce = #unmet > 0 and unmet or nil, changed = diffStats(baseMet, afterMet, want),
+				note = "before = the build with the assumptions applied but without these mods" }
 		end
 	end
 	local ok2 = pcall(recalc, b)
@@ -611,18 +639,36 @@ function methods.rank_options(p)
 			if (bestLvl[k] or -1) < (e.level or 0) then bestLvl[k] = e.level or 0 end
 		end
 	end
-	local function measure(after)
+	local function measure(after, from)
+		from = from or base
 		local changed, score = 0, 0
 		for k, v in pairs(after) do
-			if math.abs(v - (base[k] or 0)) > 1e-9 then changed = changed + 1 end
+			if math.abs(v - (from[k] or 0)) > 1e-9 then changed = changed + 1 end
 		end
 		for k, w in pairs(goal) do
-			local o, v = base[k] or 0, after[k] or 0
+			local o, v = from[k] or 0, after[k] or 0
 			-- (after-before)/max(|before|,|after|): one bounded scale (-1..1) even when before is 0
 			local d = math.max(math.abs(o), math.abs(v))
 			if d > 0 and v == v and o == o and d ~= math.huge then score = score + w * (v - o) / d end
 		end
 		return changed, score
+	end
+	-- Baselines with only the assumptions applied, shared by every candidate that needs the same ones
+	local baselines, fromAssumptionsAlone = {}, {}
+	local function baselineFor(names, assume)
+		local key = table.concat(names, "|")
+		if baselines[key] == nil then
+			local ok, snap = assumedBaseline(b, assume)
+			baselines[key] = ok and snap or false
+			-- The assumption by itself already reaches the goal (e.g. an equipped flask that's switched off in Config)
+			if ok and next(goal) then
+				local _, s0 = measure(snap)
+				if s0 > 0 then
+					fromAssumptionsAlone[#fromAssumptionsAlone + 1] = { assumed = names, score = s0 }
+				end
+			end
+		end
+		return baselines[key] or nil
 	end
 	local seen, rows, skipped = {}, {}, 0
 	local t0, budget, cap = os.clock(), p.budget or 120, p.max or 500
@@ -642,13 +688,20 @@ function methods.rank_options(p)
 			for _, l in ipairs(lines) do mods[#mods + 1] = resolveRanges(l, p.roll or "max") end
 		end
 		local text = table.concat(mods, "\n")
-		if #mods == 0 or seen[text] then skipped = skipped + 1
+		if #mods == 0 then skipped = skipped + 1
+		elseif seen[text] then
+			-- Same mod text from another source (e.g. a unique's line that also exists as a vestigial or explicit
+			-- mod): score once, but list every source on that row
+			skipped = skipped + 1
+			local also = seen[text]
+			also[#also + 1] = { src = e.src, name = e.name or e.id, spawnOn = e.spawnOn }
 		else
-			seen[text] = true
+			seen[text] = {}
 			evaluated = evaluated + 1
 			local ok, after = evalMods(b, mods)
 			if ok then
 				local changed, score = measure(after)
+				local rowBase
 				-- Conditional sources do nothing as configured; re-score them with their requirements forced on
 				local assumed
 				if (changed == 0 or score == 0) and p.assume ~= false then
@@ -665,17 +718,18 @@ function methods.rank_options(p)
 					end
 					if #assume > 0 then
 						local ok2, afterMet = evalMods(b, mods, assume)
-						if ok2 then
-							local c2, s2 = measure(afterMet)
+						local from = baselineFor(names, assume)
+						if ok2 and from then
+							local c2, s2 = measure(afterMet, from)
 							if c2 > changed or s2 > score then
-								after, changed, score, assumed = afterMet, c2, s2, names
+								after, changed, score, assumed, rowBase = afterMet, c2, s2, names, from
 							end
 						end
 					end
 				end
 				local deltas = {}
 				for _, k in ipairs(show) do
-					deltas[k] = { before = base[k] or 0, after = after[k] or 0 }
+					deltas[k] = { before = (rowBase or base)[k] or 0, after = after[k] or 0 }
 				end
 				local unsupported, requires
 				for _, l in ipairs(mods) do
@@ -687,7 +741,8 @@ function methods.rank_options(p)
 					end
 				end
 				rows[#rows + 1] = { src = e.src, name = e.name or e.id, id = e.id, mods = mods, matchedLinesOnly = partial, unsupported = unsupported, requires = requires,
-					spawnOn = e.spawnOn, score = score, statsChanged = changed, stats = deltas, assumed = assumed }
+					spawnOn = e.spawnOn, score = score, statsChanged = changed, stats = deltas, assumed = assumed,
+					alsoFrom = seen[text] }
 			end
 		end
 	end
@@ -706,6 +761,7 @@ function methods.rank_options(p)
 	end
 	return { candidates = total, evaluated = evaluated, duplicatesSkipped = skipped, timedOut = timedOut, noEffect = noEffect,
 		seconds = os.clock() - t0, roll = p.roll or "max", ranked = top,
+		alreadyOnBuildIf = #fromAssumptionsAlone > 0 and fromAssumptionsAlone or nil,
 		note = "Rows with `assumed` only score that way once those conditions hold (flask active, aura on, threshold reached...)." }
 end
 
@@ -716,7 +772,7 @@ local function normLine(l)
 end
 
 local CACHE = "agent_effects.json"
-local EFFECTS_VERSION = 2 -- bump when the key or probe logic changes; older caches are discarded
+local EFFECTS_VERSION = 3 -- bump when the key or probe logic changes; older caches are discarded
 local effects, queue, qpos  -- effects[normLine] = { text=probedText, d={stat=delta}, n=changedCount }
 
 local function loadEffects()
@@ -760,10 +816,11 @@ function methods.probe_batch(p)
 	if p.reset then effects = { _version = EFFECTS_VERSION } queue = nil end
 	if not queue then buildQueue() end
 	local base = snapshot(b.calcsTab.mainOutput)
-	local function deltas(after)
+	local probeBaselines = {}
+	local function deltas(after, from)
 		local d, n = {}, 0
 		for k, v in pairs(after) do
-			local o = base[k] or 0
+			local o = (from or base)[k] or 0
 			if math.abs(v - o) > 1e-9 then d[k] = v - o n = n + 1 end
 		end
 		return d, n
@@ -782,7 +839,12 @@ function methods.probe_batch(p)
 			-- Conditional lines: also record the effect with their requirements forced on
 			if #parsed._assume > 0 then
 				local okm, afterMet = evalMods(b, { q.text }, parsed._assume)
-				if okm then fx.dm, fx.nm = deltas(afterMet) end
+				local key = table.concat(assumedNames(parsed._assume), "|")
+				if probeBaselines[key] == nil then
+					local okB, snap = assumedBaseline(b, parsed._assume)
+					probeBaselines[key] = okB and snap or false
+				end
+				if okm and probeBaselines[key] then fx.dm, fx.nm = deltas(afterMet, probeBaselines[key]) end
 				fx.req = {}
 				for _, r in ipairs(parsed.requires) do fx.req[#fx.req + 1] = r.desc end
 			end
