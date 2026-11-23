@@ -11,7 +11,10 @@ evaluate changes with PoB's own calc engine, from a chat panel inside PoB.
   RPC handlers; `restart` (F5, dev mode) reloads all Lua.
 - `src/Classes/AgentTab.lua`: the chat panel ("Agent >>" next to Compare).
 - `agent/api/agent.mjs`: the chat agent. It runs on the Claude API with the tools defined in `agent/api/tools.mjs`.
-- `agent/tools/probe_all.py`: builds the effect index (`agent_effects.json`) on the open build.
+- `agent/api/mcp.mjs`: the same tools plus the `pob_chat_*` tools as an MCP server, for Claude Code (`.mcp.json`).
+- `agent/tools/probe_all.py`: builds the effect index (`agent_effects.json`) on the open build. `rpc.py` is a bridge
+  client; `sweeps/` and `ailment_sweep.py` check tool results across many mods; `headless_test.lua` loads the bridge
+  without the UI; `ui.sh` and `load_build.sh` drive a Wine + Xvfb copy of PoB on Linux (paths are for that machine).
 
 Hooks into PoB's own files: `Launch.lua` (start and poll the bridge), `Modules/Build.lua` (panel button and layout),
 plus flask Maim/Hinder immunity in `ModParser.lua`/`ModCache.lua`.
@@ -36,14 +39,19 @@ chat_status, chat_history`. The agent's tools and their parameters are in `agent
 
 ## Running
 - Run PoB from this tree (`runtime/Path{space}of{space}Building.exe` on Windows) with a build open. On macOS, build
-  the runtime from the `macos` branch of msciotti/PathOfBuilding-SimpleGraphic (`macos/README.md` there) and run
+  the runtime from the `main` branch of msciotti/PathOfBuilding-SimpleGraphic (`macos/README.md` there) and run
   `runtime/PathOfBuilding`.
 - `cd agent/api && npm install`, put `ANTHROPIC_API_KEY=...` in `agent/api/.env`, then `npm run agent` and chat in the
   Agent panel. `POB_AGENT_MODEL` and `POB_AGENT_EFFORT` are optional.
+- Or, from Claude Code in this tree: after `npm install` in `agent/api`, the `pob-agent` MCP server in `.mcp.json` gives
+  Claude the `pob_*` tools. To answer the Agent panel from Claude Code, loop `pob_chat_wait -> tools -> pob_chat_reply`.
 
-## Keeping up with upstream
-`dev` mirrors upstream; this work lives on `agent-main`.
+## Branches and keeping up with upstream
+- `dev` mirrors upstream/dev. Never commit to it.
+- `main` is the daily driver (the fork's default branch): upstream plus this work. Upstream comes in by merge, never
+  rebase, and `main` is never force-pushed, so every machine just pulls.
+- Work branches come off `main` and merge back into it. Fixes meant for PathOfBuildingCommunity come off `dev`.
 
     git fetch upstream
     git checkout dev && git merge --ff-only upstream/dev && git push origin dev
-    git checkout agent-main && git merge dev
+    git checkout main && git merge dev && git push origin main
