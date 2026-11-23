@@ -45,7 +45,7 @@ const status = (text) => rpc("chat_status", { text }).catch(() => {});
 const reply = (text) => rpc("chat_reply", { text });
 
 function toolLabel(name, input) {
-  const what = input.query ?? input.stat ?? input.path ?? (input.mods || input.lines || input.nodes || []).join("; ");
+  const what = input.query ?? input.stat ?? input.path ?? (input.mods || input.lines || input.nodes || input.names || [input.base ?? input.category]).map((x) => x?.text ?? x?.name ?? x).join("; ");
   return `${name.replace(/^pob_/, "")}${what ? `: ${String(what).slice(0, 80)}` : ""}`;
 }
 
@@ -57,7 +57,7 @@ async function runTool(block) {
     return { content: `Invalid input ${JSON.stringify(block.input)}: ${ajv.errorsText(validators[block.name].errors)}`, is_error: true };
   }
   try {
-    const r = await rpc(tool.method, block.input);
+    const r = tool.run ? { result: await tool.run(block.input) } : await rpc(tool.method, block.input);
     let text = JSON.stringify(r.error ?? r.result);
     if (text.length > MAX_RESULT_CHARS) {
       text = text.slice(0, MAX_RESULT_CHARS) + `\n[truncated: result was ${text.length} chars; narrow the query or lower limit/depth]`;

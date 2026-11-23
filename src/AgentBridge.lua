@@ -177,6 +177,51 @@ local function snapshot(out)
 	return addDerived(out, t)
 end
 
+-- Skills whose parts all happen on one use and so add up (skill name -> part indices). Other multi-part skills have
+-- alternative parts (one projectile vs all, trap placement...) and report the selected part only.
+local COMBINED_PARTS = {
+	["Molten Strike"] = { 1, 3 }, -- melee hit + average balls hitting (part 2 is a single ball, an alternative to 3)
+	["Molten Strike of the Zenith"] = { 1, 6 }, -- melee hit + weighted average of normal and 5th-attack balls
+}
+
+-- CombinedDPS of the main skill summed over its COMBINED_PARTS, for the build as last calculated. The selected
+-- part comes from mainOutput; each other part costs one calculation with the part switched, then restored.
+local function skillTotal(b)
+	local calcs_ = b.calcsTab.calcs
+	local out = b.calcsTab.mainOutput
+	local skill = b.calcsTab.mainEnv.player.mainSkill
+	local effect = skill and skill.activeEffect
+	local parts = effect and effect.srcInstance and COMBINED_PARTS[effect.grantedEffect.name]
+	if not parts then return out.CombinedDPS or 0 end
+	local src = effect.srcInstance
+	local selected = src.skillPart
+	local total, components = 0, {}
+	for _, part in ipairs(parts) do
+		local dps = out.CombinedDPS or 0
+		if part ~= selected then
+			src.skillPart = part
+			local ok, res = pcall(function()
+				local env_ = calcs_.initEnv(b, "CALCULATOR")
+				calcs_.perform(env_)
+				return env_.player.output.CombinedDPS or 0
+			end)
+			src.skillPart = selected
+			if not ok then error(res, 0) end
+			dps = res
+		end
+		total = total + dps
+		components[#components + 1] = { part = part, name = effect.grantedEffect.parts[part].name, dps = dps }
+	end
+	return total, components
+end
+
+local function currentStats(b)
+	local t = snapshot(b.calcsTab.mainOutput)
+	local total, components = skillTotal(b)
+	t.SkillTotalDPS = total
+	return t, components
+end
+
 local function mainSkillInfo(b)
 	local env_ = b.calcsTab and b.calcsTab.mainEnv
 	local skill = env_ and env_.player and env_.player.mainSkill
@@ -194,14 +239,22 @@ local function mainSkillInfo(b)
 		types = types }
 end
 
+local setupWarnings, unsourcedConfig, addConfigWarnings
+
 function methods.get_state()
 	local b = env().build
 	if not b then return { error = "no build loaded" } end
+	local stats, components = currentStats(b)
+	local unsourced = unsourcedConfig(b, stats)
+	local warnings, feasible = setupWarnings(b, stats)
+	addConfigWarnings(warnings, unsourced)
 	return {
 		class = b.spec and b.spec.curClassName, ascendancy = b.spec and b.spec.curAscendClassName,
 		level = b.characterLevel, mainSkill = mainSkillInfo(b),
-		dpsHint = "Use CombinedDPS (or TotalDPS for hits only) as a DPS goal. FullDPS is only set when skills are marked for Full DPS; PoisonDPS/BleedDPS are per stack, so use WithPoisonDPS/WithBleedDPS or CombinedDPS.",
-		stats = snapshot(b.calcsTab and b.calcsTab.mainOutput or {}),
+		dpsHint = "Use SkillTotalDPS as the DPS goal: it adds up the parts of a multi-part skill that happen on one use (Molten Strike) and equals CombinedDPS otherwise. CombinedDPS is only the selected skill part; TotalDPS is hits only. FullDPS is only set when skills are marked for Full DPS; PoisonDPS/BleedDPS are per stack, so use WithPoisonDPS/WithBleedDPS or CombinedDPS.",
+		skillTotal = { combined = components ~= nil, components = components },
+		warnings = warnings, feasible = feasible, unsourcedConfig = unsourced,
+		stats = stats,
 	}
 end
 
@@ -214,7 +267,7 @@ function methods.list_stats(p)
 	end
 	local q = p.query and p.query:lower()
 	local out = {}
-	for k, v in pairs(snapshot(b.calcsTab.mainOutput)) do
+	for k, v in pairs((currentStats(b))) do
 		if not q or k:lower():find(q, 1, true) or (labels[k] or ""):lower():find(q, 1, true) then
 			out[#out + 1] = { stat = k, label = labels[k], value = v }
 		end
@@ -353,13 +406,16 @@ local function recalc(b, extra, totalsFor)
 		if m.config and configSaved[m.config] == nil then
 			configSaved[m.config] = input[m.config] or false
 			input[m.config] = true
+		elseif m.configOff and configSaved[m.configOff] == nil then
+			configSaved[m.configOff] = input[m.configOff] or false
+			input[m.configOff] = nil
 		end
 	end
 	b.configTab:BuildModList()
 	for var, old in pairs(configSaved) do input[var] = old or nil end
 	local flaskSlots = {}
 	for _, m in ipairs(extra or {}) do
-		if m.config then
+		if m.config or m.configOff then
 		elseif m.raw then
 			b.configTab.modList:AddMod(m.raw)
 		elseif m.clear then
@@ -407,7 +463,21 @@ local function evalMods(b, lines, extra, totalsFor)
 	list[#list + 1] = block
 	local ok, after, totals = pcall(recalc, b, extra, totalsFor)
 	for i = #list, 1, -1 do if list[i] == block then table.remove(list, i) end end
-	return ok, after, totals
+	local components
+	if ok then
+		local okT, total, comps = pcall(skillTotal, b)
+		if okT then after.SkillTotalDPS, components = total, comps else ok, after = false, total end
+	end
+	return ok, after, totals, components
+end
+
+local function partsDiff(before, after)
+	if not (before and after) then return nil end
+	local parts = { combined = true, components = {} }
+	for i, c in ipairs(before) do
+		parts.components[i] = { part = c.part, name = c.name, before = c.dps, after = after[i].dps }
+	end
+	return parts
 end
 
 local function mainSkill(b)
@@ -454,10 +524,180 @@ local function assumedNames(assume)
 	return names
 end
 
+local function chargeSource(charge)
+	return {
+		text = { "gain[^%.]-" .. charge .. "[%a, ]-charge", "steal[^%.]-" .. charge .. "[%a, ]-charge" },
+		notText = { "per ", "cannot gain", "when you gain", "would gain", "instead gain", "minion", "enemies", "while you have" },
+		gemStat = { "gain_" .. charge .. "_charge", "grant_" .. charge .. "_charge", "add_" .. charge .. "_charge", "grants_x_additional_" .. charge .. "_charge" },
+	}
+end
+
+local function ailmentSource(ailment)
+	return {
+		text = { "chance to " .. ailment, ailment .. " enem", "always " .. ailment, "inflicts? " .. ailment, "can " .. ailment },
+		notText = { "cannot", "avoid" },
+		gemStat = { "chance_to_" .. ailment, "always_" .. ailment },
+	}
+end
+
+-- Config options that only mean something when the build can produce the effect. `text` and `notText` are Lua
+-- patterns on the lowercased mod lines of equipped items and allocated nodes (masteries included), `gems` are gem
+-- names and `gemStat` patterns on stat ids of the socketed gems. `flags` are the skill flags PoB itself sets for such
+-- a source (the same test the Config tab uses to show an option),
+-- `skillTypes` and `skillsFromOption` (the option's own ifSkill list) match active skills.
+local CONFIG_SOURCES = {
+	buffFortification = { text = { "fortify%f[%A]", "gain %d+ fortification", "you have your maximum fortification" },
+		notText = { "while you have fortify", "while fortified", "kill" }, gems = { "Fortify", "Vigilant Strike" } },
+	useEnduranceCharges = chargeSource("endurance"),
+	useFrenzyCharges = chargeSource("frenzy"),
+	usePowerCharges = chargeSource("power"),
+	buffOnslaught = { text = { "gain[^%.]-onslaught", "grants? onslaught", "you have onslaught" },
+		notText = { "minion", "effect of onslaught", "while you have onslaught", "during onslaught" }, gems = { "Manifest Dancing Dervishes" } },
+	multiplierRage = { flags = { "Condition:CanGainRage" } },
+	bloodSandStance = { skillsFromOption = true },
+	conditionEnemyShocked = ailmentSource("shock"),
+	conditionEnemyChilled = ailmentSource("chill"),
+	conditionEnemyIgnited = ailmentSource("ignite"),
+	conditionEnemyIntimidated = { text = { "intimidate enem", "are intimidated", "chance to intimidate" },
+		gems = { "Intimidating Cry" }, gemStat = { "chance_to_intimidate" } },
+	conditionEnemyUnnerved = { text = { "unnerve enem", "are unnerved", "chance to unnerve" }, gemStat = { "chance_to_unnerve" } },
+	conditionEnemyCoveredInAsh = { text = { "in ash" }, gemStat = { "cover_in_ash" } },
+	conditionEnemyFireExposure = { flags = { "applyFireExposure" } },
+	conditionEnemyColdExposure = { flags = { "applyColdExposure" } },
+	conditionEnemyLightningExposure = { flags = { "applyLightningExposure" } },
+	buffElusive = { flags = { "Condition:CanBeElusive" } },
+	buffTailwind = { text = { "gain tailwind", "grants? tailwind", "have tailwind" }, notText = { "while you have tailwind", "effect of tailwind" } },
+	buffAdrenaline = { text = { "gain adrenaline", "grants? adrenaline", "have adrenaline" },
+		notText = { "when you gain adrenaline", "while you have" }, gems = { "Fresh Meat" } },
+	buffArcaneSurge = { text = { "gain arcane surge", "grants? arcane surge", "have arcane surge" },
+		notText = { "while you have", "arcane surge also" }, gems = { "Arcane Surge" } },
+	buffPhasing = { text = { "gain phasing", "grants? phasing", "you have phasing" }, notText = { "while you have phasing" }, gems = { "Phase Run" } },
+	buffUnholyMight = { text = { "gain unholy might", "grants? unholy might", "have unholy might" }, notText = { "minion" } },
+	conditionEnemyCursed = { text = { "curse enem" }, gems = { "Hextouch" }, skillTypes = { "Hex", "Mark", "AppliesCurse" } },
+}
+
+local function anyFind(patterns, s)
+	for _, pat in ipairs(patterns or {}) do
+		if s:find(pat) then return true end
+	end
+	return false
+end
+
+-- What the build provides: mod lines of equipped items and allocated nodes (and any hypothetical `lines`), plus gem
+-- names and stat ids.
+local function buildSources(b, lines)
+	local env_ = b.calcsTab.mainEnv
+	local src = { lines = {}, gems = {}, stats = {} }
+	for _, line in ipairs(lines or {}) do src.lines[#src.lines + 1] = StripEscapes(line):lower() end
+	for _, item in pairs(env_.player.itemList) do
+		for key, list in pairs(item) do
+			if type(key) == "string" and key:match("ModLines$") then
+				for _, modLine in ipairs(list) do
+					if item:CheckModLineVariant(modLine) then src.lines[#src.lines + 1] = StripEscapes(modLine.line):lower() end
+				end
+			end
+		end
+	end
+	for _, node in pairs(env_.allocNodes) do
+		for _, line in ipairs(node.sd or {}) do src.lines[#src.lines + 1] = StripEscapes(line):lower() end
+	end
+	local function addGem(effect)
+		local ge = effect.grantedEffect
+		src.gems[ge.name] = true
+		for _, id in ipairs(ge.stats or {}) do src.stats[#src.stats + 1] = id end
+		for _, stat in ipairs(ge.constantStats or {}) do src.stats[#src.stats + 1] = stat[1] end
+	end
+	for _, skill in ipairs(env_.player.activeSkillList) do
+		addGem(skill.activeEffect)
+		for _, support in ipairs(skill.supportList or {}) do addGem(support) end
+	end
+	return src
+end
+
+local function hasSource(b, opt, def, have)
+	local env_ = b.calcsTab.mainEnv
+	local main = env_.player.mainSkill
+	for _, line in ipairs(have.lines) do
+		if anyFind(def.text, line) and not anyFind(def.notText, line) then return true end
+	end
+	for _, name in ipairs(def.gems or {}) do
+		if have.gems[name] then return true end
+	end
+	for _, id in ipairs(have.stats) do
+		if anyFind(def.gemStat, id) then return true end
+	end
+	for _, flag in ipairs(def.flags or {}) do
+		if main.skillFlags[flag] or main.skillModList:Flag(nil, flag) then return true end
+	end
+	for _, name in ipairs(def.skillsFromOption and opt.ifSkill or {}) do
+		if env_.skillsUsed[name] then return true end
+	end
+	for _, skill in ipairs(env_.player.activeSkillList) do
+		for _, typeName in ipairs(def.skillTypes or {}) do
+			if skill.skillTypes[SkillType[typeName]] then return true end
+		end
+	end
+	return false
+end
+
+-- Config options that are switched on while nothing in the build provides them, with DPS and EHP as if each were
+-- off. `on` is the stats of the state being checked; `lines`/`extra` re-create that state for each recalculation.
+function unsourcedConfig(b, on, lines, extra)
+	local input = b.configTab.configSets[b.configTab.activeConfigSetId].input
+	local have
+	local out = {}
+	for _, opt in ipairs(configOptions()) do
+		local def = opt.var and CONFIG_SOURCES[opt.var]
+		local value = input[opt.var]
+		if def and value and value ~= 0 then
+			have = have or buildSources(b, lines)
+			if not hasSource(b, opt, def, have) then
+				local entries = {}
+				for i, m in ipairs(extra or {}) do entries[i] = m end
+				entries[#entries + 1] = { configOff = opt.var }
+				local ok, after = evalMods(b, lines or {}, entries)
+				out[#out + 1] = { option = StripEscapes(opt.label):gsub(":$", ""), var = opt.var,
+					dps = on.SkillTotalDPS, dpsOff = ok and after.SkillTotalDPS or nil,
+					ehp = on.TotalEHP, ehpOff = ok and after.TotalEHP or nil }
+			end
+		end
+	end
+	if #out > 0 then pcall(recalc, b) end
+	return out
+end
+
+function addConfigWarnings(warnings, unsourced)
+	for _, u in ipairs(unsourced) do
+		warnings[#warnings + 1] = string.format("Config option '%s' is on but nothing in the build provides it", u.option)
+	end
+end
+
+-- Costs the main skill can't pay: mana (energy shield included where it pays for mana) and life.
+local function unpayable(stats)
+	local out = {}
+	if (stats.ManaCost or 0) > (stats.ManaCostPayablePool or stats.ManaUnreserved or 0) then
+		out[#out + 1] = string.format("The main skill costs %d Mana per use but only %d Mana is unreserved", stats.ManaCost, stats.ManaCostPayablePool or stats.ManaUnreserved or 0)
+	end
+	if (stats.LifeCost or 0) > (stats.LifeUnreserved or 0) then
+		out[#out + 1] = string.format("The main skill costs %d Life per use but only %d Life is unreserved", stats.LifeCost, stats.LifeUnreserved or 0)
+	end
+	return out
+end
+
+-- PoB's own sidebar warnings for the state as last calculated (refreshing the sidebar), then ours.
+function setupWarnings(b, stats)
+	b:RefreshStatList()
+	local warnings = {}
+	for _, line in ipairs(b.controls.warnings.lines) do warnings[#warnings + 1] = StripEscapes(line) end
+	local costs = unpayable(stats)
+	for _, line in ipairs(costs) do warnings[#warnings + 1] = line end
+	return warnings, #costs == 0
+end
+
 function methods.what_if(p)
 	local b = env().build
 	if not b then return { error = "no build loaded" } end
-	local base = snapshot(b.calcsTab.mainOutput)
+	local base, baseComponents = currentStats(b)
 	local lines, unsupported, reqs, assume, unmet, seen, names = {}, {}, {}, {}, {}, {}, {}
 	local alreadyKeystone, socketedMods, socketedInfo, flagMismatch, hitOnly = {}, {}, {}, {}, {}
 	for _, l in ipairs(p.mods or {}) do
@@ -513,7 +753,9 @@ function methods.what_if(p)
 
 	local totalsBefore = modTotals(b, names)
 	local flagsBefore = copyTable((mainSkill(b) or {}).skillFlags or {}, true)
-	local ok, after, totalsAfter = evalMods(b, lines, socketedMods, names)
+	local ok, after, totalsAfter, afterComponents = evalMods(b, lines, socketedMods, names)
+	local warnings, feasible
+	if ok then warnings, feasible = setupWarnings(b, after) end
 	for _, m in ipairs(socketedMods) do table.insert(assume, 1, m) end
 	if ok then
 		local flagsAfter = (mainSkill(b) or {}).skillFlags or {}
@@ -549,7 +791,10 @@ function methods.what_if(p)
 		end
 	end
 	local ok2 = pcall(recalc, b)
+	b:RefreshStatList()
 	if not ok then return { error = tostring(after) } end
+	local unsourced = unsourcedConfig(b, after, lines, socketedMods)
+	addConfigWarnings(warnings, unsourced)
 
 	local diff = diffStats(base, after, want)
 	local current, changedOther
@@ -603,7 +848,8 @@ function methods.what_if(p)
 			note = "Parsed but no output stat changed: the build may already have this effect (check `current` via stats) or it isn't shown in calc output."
 		end
 	end
-	return { applied = lines, changed = diff, current = current, requires = #reqs > 0 and reqs or nil,
+	local totalParts = partsDiff(baseComponents, afterComponents)
+	return { applied = lines, changed = diff, warnings = warnings, feasible = feasible, unsourcedConfig = unsourced, skillTotal = totalParts, current = current, requires = #reqs > 0 and reqs or nil,
 		ifConditionsMet = met, modTotals = totals, socketedAppliedTo = #socketedInfo > 0 and socketedInfo or nil, changedOther = changedOther, capped = #capped > 0 and capped or nil, unsupported = #unsupported > 0 and unsupported or nil, restored = ok2, note = note }
 end
 
@@ -708,7 +954,11 @@ function methods.rank_options(p)
 	for k in pairs(goal) do show[#show + 1] = k end
 	for _, k in ipairs(p.stats or {}) do show[#show + 1] = k end
 
-	local base = snapshot(b.calcsTab.mainOutput)
+	local base = currentStats(b)
+	local unsourced = unsourcedConfig(b, base)
+	local warnings, feasible = setupWarnings(b, base)
+	addConfigWarnings(warnings, unsourced)
+	local infeasible, infeasibleCount = {}, 0
 	local bestLvl = {}
 	for _, e in ipairs(res) do
 		if e.group then
@@ -792,7 +1042,7 @@ function methods.rank_options(p)
 		else
 			seen[text] = {}
 			evaluated = evaluated + 1
-			local ok, after = evalMods(b, mods)
+			local ok, after, _, components = evalMods(b, mods)
 			if ok then
 				local changed, score = measure(after)
 				local rowBase
@@ -810,12 +1060,12 @@ function methods.rank_options(p)
 						end
 					end
 					if #assume > 0 then
-						local ok2, afterMet = evalMods(b, mods, assume)
+						local ok2, afterMet, _, componentsMet = evalMods(b, mods, assume)
 						local from = baselineFor(names, assume)
 						if ok2 and from then
 							local c2, s2 = measure(afterMet, from)
 							if c2 > changed or s2 > score then
-								after, changed, score, assumed, rowBase = afterMet, c2, s2, names, from
+								after, changed, score, assumed, rowBase, components = afterMet, c2, s2, names, from, componentsMet
 							end
 						end
 					end
@@ -833,14 +1083,21 @@ function methods.rank_options(p)
 						requires[#requires + 1] = q.desc .. (q.metOnBuild and " (met)" or q.metOnBuild == false and " (not met)" or "")
 					end
 				end
-				rows[#rows + 1] = { src = e.src, name = e.name or e.id, id = e.id, mods = mods, matchedLinesOnly = partial, unsupported = unsupported, requires = requires,
-					spawnOn = e.spawnOn, score = score, statsChanged = changed, stats = deltas, assumed = assumed,
-					alsoFrom = seen[text], obtain = e.obtain, pathDist = status and status.pathDist,
-					alreadyOnBuild = status and status.allocated or nil }
+				local problems = unpayable(after)
+				if #problems == 0 then
+					rows[#rows + 1] = { src = e.src, name = e.name or e.id, id = e.id, mods = mods, matchedLinesOnly = partial, unsupported = unsupported, requires = requires,
+						spawnOn = e.spawnOn, score = score, statsChanged = changed, stats = deltas, skillParts = components, assumed = assumed,
+						alsoFrom = seen[text], obtain = e.obtain, pathDist = status and status.pathDist,
+						alreadyOnBuild = status and status.allocated or nil }
+				elseif changed > 0 then
+					infeasibleCount = infeasibleCount + 1
+					if #infeasible < 10 then infeasible[#infeasible + 1] = { src = e.src, name = e.name or e.id, warnings = problems } end
+				end
 			end
 		end
 	end
 	pcall(recalc, b)
+	b:RefreshStatList()
 	local useGoal = next(goal) ~= nil
 	table.sort(rows, function(x, y)
 		if useGoal and x.score ~= y.score then return x.score > y.score end
@@ -855,6 +1112,8 @@ function methods.rank_options(p)
 	end
 	return { candidates = total, evaluated = evaluated, duplicatesSkipped = skipped, timedOut = timedOut, noEffect = noEffect,
 		seconds = os.clock() - t0, roll = p.roll or "max", ranked = top,
+		warnings = warnings, feasible = feasible, unsourcedConfig = unsourced,
+		infeasible = infeasibleCount > 0 and { count = infeasibleCount, examples = infeasible } or nil,
 		alreadyOnBuildIf = #fromAssumptionsAlone > 0 and fromAssumptionsAlone or nil,
 		alreadyAllocated = #allocatedSkipped > 0 and allocatedSkipped or nil,
 		note = "Rows with `assumed` only score that way once those conditions hold (flask active, aura on, threshold reached...). "
@@ -1030,6 +1289,77 @@ function methods.effect_stats(p)
 		statsMoved = statCounts }
 end
 
+function methods.gem_what_if(p)
+	local b = env().build
+	if not b then return { error = "no build loaded" } end
+	local group = b.skillsTab.socketGroupList[p.group or b.mainSocketGroup]
+	if not group then return { error = "no such socket group" } end
+	local base, baseComponents = currentStats(b)
+	local want
+	if p.stats then want = {} for _, k in ipairs(p.stats) do want[k] = true end end
+	local original, saved, used = {}, {}, {}
+	for i, g in ipairs(group.gemList) do
+		original[i] = g
+		saved[g] = { level = g.level, quality = g.quality }
+	end
+	local function restore()
+		group.gemList = {}
+		for i, g in ipairs(original) do
+			group.gemList[i] = g
+			g.level, g.quality = saved[g].level, saved[g].quality
+		end
+		b.skillsTab:ProcessSocketGroup(group)
+	end
+	local function find(name)
+		for i, g in ipairs(group.gemList) do
+			if g.nameSpec:lower() == name:lower() then return g, i end
+		end
+	end
+	for _, c in ipairs(p.gems or {}) do
+		local gem, at = find(c.name)
+		local was = gem and { level = gem.level, quality = gem.quality }
+		local action = gem and "set" or "added"
+		local replaced
+		if c.replace then
+			local old, oldAt = find(c.replace)
+			if not old then
+				restore()
+				return { error = c.replace .. " is not in the socket group" }
+			end
+			replaced = old.nameSpec
+			gem = { nameSpec = c.name, enabled = old.enabled, enableGlobal1 = true, enableGlobal2 = true, count = 1, qualityId = "Default" }
+			group.gemList[oldAt] = gem
+			was, action = nil, "replaced"
+		elseif not gem then
+			gem = { nameSpec = c.name, enabled = true, enableGlobal1 = true, enableGlobal2 = true, count = 1, qualityId = "Default" }
+			table.insert(group.gemList, gem)
+		end
+		gem.level, gem.quality = c.level or 1, c.quality or 20
+		used[#used + 1] = { gem = gem, was = was, action = action, replaced = replaced }
+		b.skillsTab:ProcessSocketGroup(group)
+		if gem.errMsg then
+			local err = gem.errMsg
+			restore()
+			return { error = c.name .. ": " .. err }
+		end
+		if not c.level then
+			gem.level = gem.gemData.naturalMaxLevel
+			b.skillsTab:ProcessSocketGroup(group)
+		end
+	end
+	local ok, after, _, components = evalMods(b, {})
+	local gems = {}
+	for _, u in ipairs(used) do
+		local max = u.gem.gemData.naturalMaxLevel
+		gems[#gems + 1] = { name = u.gem.nameSpec, action = u.action, replaced = u.replaced, level = u.gem.level, quality = u.gem.quality,
+			naturalMaxLevel = max, needsCorruption = (u.gem.level > max or u.gem.quality > 20) or nil, was = u.was }
+	end
+	restore()
+	local restored = pcall(recalc, b)
+	if not ok then return { error = tostring(after) } end
+	return { gems = gems, changed = diffStats(base, after, want), skillTotal = partsDiff(baseComponents, components), restored = restored }
+end
+
 function methods.import_character(p)
 	local main = env().main
 	if not main then return { error = "PoB not ready" } end
@@ -1088,6 +1418,740 @@ function methods.import_character(p)
 		b.spec:SetWindowTitleWithBuildClass()
 		return { imported = true, file = b.dbFileName, class = charInfo.class, league = charInfo.league, level = charInfo.level }
 	end }
+end
+
+local VARIANT_STATS = { "SkillTotalDPS", "TotalEHP", "Life", "LifeUnreserved", "ManaUnreserved", "FireResist", "ColdResist",
+	"LightningResist", "ChaosResist", "PhysicalMaximumHitTaken", "FireMaximumHitTaken", "ColdMaximumHitTaken",
+	"LightningMaximumHitTaken", "ChaosMaximumHitTaken" }
+local MAX_VARIANTS = 40
+
+local function findNodes(spec, want)
+	local id = tonumber(want)
+	if id then return { spec.nodes[id] } end
+	local found = {}
+	for _, n in pairs(spec.nodes) do
+		if n.dn and n.dn:lower() == tostring(want):lower() and not n.isProxy and n.group then found[#found + 1] = n end
+	end
+	return found
+end
+
+-- Without a level the gem gets its natural max level once processGroup has looked it up.
+local function newGem(spec, level, quality)
+	local name, lvl, q = tostring(spec):match("^([^:]+):?(%d*):?(%d*)$")
+	local explicit = tonumber(lvl) or level
+	return { nameSpec = name, level = explicit or 1, quality = tonumber(q) or quality or 20, enabled = true,
+		enableGlobal1 = true, enableGlobal2 = true, count = 1, qualityId = "Default" }, not explicit
+end
+
+-- `touched` lists the new gems ({ gem, auto }); processGroup fills in their levels and reports what was used.
+local function processGroup(b, group, touched, used)
+	b.skillsTab:ProcessSocketGroup(group)
+	for _, t in ipairs(touched) do
+		if t.gem.errMsg then error(t.gem.nameSpec .. ": " .. t.gem.errMsg, 0) end
+		if t.auto and t.gem.gemData then t.gem.level = t.gem.gemData.naturalMaxLevel end
+	end
+	b.skillsTab:ProcessSocketGroup(group)
+	for _, t in ipairs(touched) do
+		local max = t.gem.gemData and t.gem.gemData.naturalMaxLevel
+		used[#used + 1] = { name = t.gem.nameSpec, level = t.gem.level, quality = t.gem.quality,
+			needsCorruption = max and t.gem.level > max or nil }
+	end
+end
+
+local function socketGroup(b, n)
+	local group = b.skillsTab.socketGroupList[tonumber(n) or 0]
+	if not group then error("no socket group " .. tostring(n), 0) end
+	return group
+end
+
+-- Applies one change to the build and pushes its undo onto `undo`; mod lines go to `lines` for evalMods.
+local function applyChange(b, change, undo, lines, unsupported, roll, used)
+	local items, spec = b.itemsTab, b.spec
+	local function saveTree()
+		if not undo.tree then
+			local state = spec:CreateUndoState()
+			undo.tree = true
+			undo[#undo + 1] = function() spec:RestoreUndoState(state) end
+		end
+	end
+	if change.equip then
+		local slot = items.slots[change.equip.slot]
+		if not slot then error("unknown slot " .. tostring(change.equip.slot), 0) end
+		local item = new("Item"):Item(tostring(change.equip.item))
+		if not item.base then error("unknown item base in the item text", 0) end
+		if not items:IsItemValidForSlot(item, slot.slotName) then error(item.baseName .. " can't go in " .. slot.slotName, 0) end
+		items:AddItem(item, true)
+		local prev = slot.selItemId
+		undo[#undo + 1] = function()
+			slot:SetSelItemId(prev)
+			items:DeleteItem(item, true)
+			items:PopulateSlots()
+		end
+		slot:SetSelItemId(item.id)
+		items:PopulateSlots()
+	elseif change.unequip then
+		local slot = items.slots[change.unequip]
+		if not slot then error("unknown slot " .. tostring(change.unequip), 0) end
+		local prev = slot.selItemId
+		undo[#undo + 1] = function() slot:SetSelItemId(prev) items:PopulateSlots() end
+		slot:SetSelItemId(0)
+		items:PopulateSlots()
+	elseif change.gems then
+		local group = socketGroup(b, change.gems.group)
+		local prev = group.gemList
+		undo[#undo + 1] = function() group.gemList = prev end
+		group.gemList = {}
+		local touched = {}
+		for _, g in ipairs(change.gems.gems or {}) do
+			local gem, auto = newGem(g)
+			group.gemList[#group.gemList + 1] = gem
+			touched[#touched + 1] = { gem = gem, auto = auto }
+		end
+		processGroup(b, group, touched, used)
+	elseif change.swapGem then
+		local c = change.swapGem
+		local group = socketGroup(b, c.group)
+		local prev = group.gemList
+		undo[#undo + 1] = function() group.gemList = prev end
+		local at
+		for i, gem in ipairs(prev) do
+			if c.from and gem.nameSpec:lower() == tostring(c.from):lower() then at = i break end
+		end
+		if c.from and not at then error("no gem '" .. c.from .. "' in socket group " .. c.group, 0) end
+		group.gemList = {}
+		for i, gem in ipairs(prev) do group.gemList[i] = gem end
+		local touched = {}
+		if c.to then
+			local gem, auto = newGem(c.to, c.level, c.quality)
+			group.gemList[at or #group.gemList + 1] = gem
+			touched[1] = { gem = gem, auto = auto }
+		elseif at then
+			table.remove(group.gemList, at)
+		else
+			error("swapGem needs `from` or `to`", 0)
+		end
+		processGroup(b, group, touched, used)
+	elseif change.allocate then
+		saveTree()
+		for _, want in ipairs(change.allocate) do
+			local nodes = findNodes(spec, want)
+			if #nodes == 0 then error("unknown node " .. tostring(want), 0) end
+			local best
+			for _, n in ipairs(nodes) do
+				if n.alloc then best = nil break end
+				if n.path and (not best or #n.path < #best.path) then best = n end
+			end
+			if best then
+				if best.type == "Mastery" then error("mastery nodes need an effect choice, which compare_variants can't set", 0) end
+				spec:AllocNode(best)
+			elseif not nodes[1].alloc then
+				error("no path to " .. tostring(want), 0)
+			end
+		end
+	elseif change.deallocate then
+		saveTree()
+		for _, want in ipairs(change.deallocate) do
+			local nodes = findNodes(spec, want)
+			if #nodes == 0 then error("unknown node " .. tostring(want), 0) end
+			for _, n in ipairs(nodes) do
+				if n.alloc then spec:DeallocNode(n) end
+			end
+		end
+		spec:BuildAllDependsAndPaths()
+	elseif change.config then
+		local input = b.configTab.configSets[b.configTab.activeConfigSetId].input
+		for var, value in pairs(change.config) do
+			local opt
+			for _, o in ipairs(configOptions()) do
+				if o.var == var then opt = o break end
+			end
+			if not opt then error("unknown config option " .. tostring(var), 0) end
+			if opt.type == "check" then
+				value = value and value ~= 0 or false
+			elseif opt.type == "list" then
+				local known
+				for _, entry in ipairs(opt.list) do
+					if entry.val == value then known = true end
+				end
+				if not known then error("invalid value for config option " .. var, 0) end
+			elseif type(value) ~= "number" and opt.type ~= "text" then
+				error("config option " .. var .. " takes a number", 0)
+			end
+			local prev = input[var]
+			undo[#undo + 1] = function() input[var] = prev end
+			input[var] = value
+		end
+	elseif change.mods then
+		for _, l in ipairs(change.mods) do
+			local r = parseLine(l, roll)
+			lines[#lines + 1] = r.resolved or l
+			if not r.supported then unsupported[#unsupported + 1] = l end
+		end
+	else
+		error("unknown change type", 0)
+	end
+end
+
+-- The variant's changes are applied, evaluated and undone again; `raw` carries the unrounded stats for the deltas.
+local function variantRow(b, variant, want, roll)
+	local undo, lines, unsupported, used = {}, {}, {}, {}
+	local ok, err = pcall(function()
+		for _, change in ipairs(variant.changes or {}) do
+			applyChange(b, change, undo, lines, unsupported, roll, used)
+		end
+	end)
+	local row
+	if ok then
+		local okEval, after, _, components = evalMods(b, lines)
+		if okEval then
+			local warnings, feasible = setupWarnings(b, after)
+			local unsourced = unsourcedConfig(b, after, lines)
+			addConfigWarnings(warnings, unsourced)
+			local stats = {}
+			for _, k in ipairs(want) do stats[k] = jsonNumber(after[k]) end
+			row = { stats = stats, skillTotal = components, gems = #used > 0 and used or nil, warnings = warnings, feasible = feasible, unsourcedConfig = unsourced,
+				unsupported = #unsupported > 0 and unsupported or nil, raw = after }
+		else
+			err = after
+		end
+	end
+	for i = #undo, 1, -1 do
+		local okU, errU = pcall(undo[i])
+		if not okU then err = (err and tostring(err) .. "; " or "") .. "restore failed: " .. tostring(errU) end
+	end
+	if not row then row = { error = tostring(err) } end
+	row.name = variant.name
+	return row
+end
+
+function methods.compare_variants(p)
+	local b = env().build
+	if not b then return { error = "no build loaded" } end
+	if type(p.variants) ~= "table" or #p.variants == 0 then return { error = "variants required" } end
+	if #p.variants > MAX_VARIANTS then return { error = "at most " .. MAX_VARIANTS .. " variants per call" } end
+	local want = p.stats or VARIANT_STATS
+	local base = variantRow(b, { name = "baseline" }, want, p.roll)
+	if base.error then return { error = base.error } end
+	local rows = {}
+	for i, v in ipairs(p.variants) do
+		v.name = v.name or ("variant " .. i)
+		local row = variantRow(b, v, want, p.roll)
+		if row.raw then
+			row.delta = {}
+			for _, k in ipairs(want) do
+				if type(base.raw[k]) == "number" and type(row.raw[k]) == "number" then row.delta[k] = jsonNumber(row.raw[k] - base.raw[k]) end
+			end
+		end
+		row.raw = nil
+		rows[i] = row
+	end
+	base.raw = nil
+	pcall(recalc, b)
+	b:RefreshStatList()
+	return { baseline = base, variants = rows }
+end
+
+-- Rare item design: items are built from PoB's own mod pools (Item:CanHaveMod) and written back with BuildRaw, so the
+-- text is what PoB's crafting UI produces and compare_variants' `equip` takes it as is.
+local DEFAULT_ILVL = 86
+local ROLLS = { max = 1, mid = 0.5, min = 0 }
+local INFLUENCE_KEYS = { shaper = "Shaper", elder = "Elder", crusader = "Crusader", redeemer = "Redeemer", hunter = "Hunter", warlord = "Warlord" }
+local INFLUENCE_TAGS = { redeemer = "eyrie", hunter = "basilisk", warlord = "adjudicator" }
+-- Proposals assume what is common on trade: the second best tier, rolled 70% of the way up its range.
+local PROPOSAL_TIER, PROPOSAL_ROLL = 2, 0.7
+local RESIST_TEXT = { Fire = "+#% to Fire Resistance", Cold = "+#% to Cold Resistance", Lightning = "+#% to Lightning Resistance" }
+local MAX_FILL_SLOTS = 6
+
+local function lineTemplate(line)
+	local t = line:gsub("%(%-?[%d%.]+%-%-?[%d%.]+%)", "#"):gsub("%-?%d+%.?%d*", "#"):gsub("^%+", "")
+	return (t:lower():gsub("%s+", " "):match("^%s*(.-)%s*$"))
+end
+
+local function modTemplate(mod)
+	local parts = {}
+	for i, line in ipairs(mod) do parts[i] = lineTemplate(line) end
+	return table.concat(parts, " / ")
+end
+
+local function requestTemplate(text)
+	local parts = {}
+	for part in (text .. " / "):gmatch("(.-) / ") do parts[#parts + 1] = lineTemplate(part) end
+	return table.concat(parts, " / ")
+end
+
+local function ordinal(n)
+	return n .. (n == 1 and "st" or n == 2 and "nd" or n == 3 and "rd" or "th")
+end
+
+local function rolledValue(mod, range)
+	return tonumber(itemLib.applyRange(mod[1], range):match("%-?%d+%.?%d*"))
+end
+
+local function parseRoll(roll)
+	if type(roll) == "number" and roll >= 0 and roll <= 1 then return roll end
+	return ROLLS[roll or "mid"]
+end
+
+-- An unrolled rare of the given base with its normal implicit and no explicit mods, or nil and the reason.
+local function newRare(spec, ilvl)
+	local key = tostring(spec.base):lower()
+	local baseName
+	for name in pairs(data.itemBases) do
+		if name:lower() == key then baseName = name break end
+	end
+	if not baseName then
+		local close = {}
+		for name in pairs(data.itemBases) do
+			if name:lower():find(key, 1, true) then close[#close + 1] = name end
+		end
+		table.sort(close)
+		return nil, "unknown base '" .. tostring(spec.base) .. "'" .. (#close > 0 and " (did you mean " .. table.concat(close, ", ", 1, math.min(#close, 5)) .. "?)" or "")
+	end
+	local entry = data.itemBases[baseName]
+	if entry.flask or entry.tincture then return nil, baseName .. " can't be a rare item" end
+	local lines = { "Rarity: RARE", "Agent Design", baseName }
+	for _, name in ipairs(spec.influences or {}) do
+		local display = INFLUENCE_KEYS[tostring(name):lower()]
+		if not display then return nil, "unknown influence '" .. tostring(name) .. "'" end
+		lines[#lines + 1] = display .. " Item"
+	end
+	lines[#lines + 1] = "Crafted: true"
+	lines[#lines + 1] = "Item Level: " .. ilvl
+	local implicits = {}
+	for l in (spec.implicit or entry.implicit or ""):gmatch("[^\n]+") do implicits[#implicits + 1] = l end
+	lines[#lines + 1] = "Implicits: " .. #implicits
+	for _, l in ipairs(implicits) do lines[#lines + 1] = l end
+	local item = new("Item"):Item(table.concat(lines, "\n"))
+	if not item.base or not item.affixes then return nil, "can't build " .. baseName end
+	return item
+end
+
+-- Implicit lines of the bases that differ only in implicit (Two-Stone Ring comes with three resist pairs)
+local function implicitVariants(baseName)
+	local entry, family = data.itemBases[baseName], baseName:gsub(" %(.-%)$", "")
+	local out, seen = {}, {}
+	for name, other in pairs(data.itemBases) do
+		if name:gsub(" %(.-%)$", "") == family and other.subType == entry.subType and other.implicit and not seen[other.implicit] then
+			seen[other.implicit] = true
+			out[#out + 1] = other.implicit
+		end
+	end
+	table.sort(out)
+	return out
+end
+
+local function newContext(spec)
+	local ilvl = tonumber(spec.ilvl) or DEFAULT_ILVL
+	local item, err = newRare(spec, ilvl)
+	if not item then return nil, err end
+	local prefixLimit = item.prefixes.limit or item.affixLimit / 2
+	local suffixLimit = item.suffixes.limit or item.affixLimit / 2
+	return { item = item, spec = spec, ilvl = ilvl, limit = { Prefix = prefixLimit, Suffix = suffixLimit } }
+end
+
+-- Tiers of the one mod group matching `template`, best first, each marked `allowed` when the item level reaches it.
+-- Returns nil and the reason when the item can't have the mod.
+local function findTiers(ctx, template, crafted)
+	local item = ctx.item
+	local exact, partial = {}, {}
+	local function consider(id, mod)
+		if mod.type ~= "Prefix" and mod.type ~= "Suffix" then return end
+		if modTemplate(mod) == template then
+			exact[#exact + 1] = { id = id, mod = mod }
+		elseif #mod > 1 then
+			for _, line in ipairs(mod) do
+				if lineTemplate(line) == template then partial[#partial + 1] = { id = id, mod = mod } break end
+			end
+		end
+	end
+	if crafted then
+		for i, mod in ipairs(data.masterMods) do
+			if mod.types[item.type] then consider(i, mod) end
+		end
+	else
+		for id, mod in pairs(item.affixes) do
+			if not item:CheckIfModIsDelve(mod) then consider(id, mod) end
+		end
+	end
+	local found = #exact > 0 and exact or partial
+	if #found == 0 then return nil, "no such modifier" end
+	local fits = {}
+	for _, c in ipairs(found) do
+		if crafted or item:CanHaveMod(c.mod) then fits[#fits + 1] = c end
+	end
+	if #fits == 0 then
+		for key, display in pairs(INFLUENCE_KEYS) do
+			local tag = item.base.influenceTags and item.base.influenceTags[INFLUENCE_TAGS[key] or key]
+			for _, c in ipairs(found) do
+				if tag and item:CanHaveMod(c.mod, { [tag] = true }) then return nil, "needs " .. display .. " influence" end
+			end
+		end
+		return nil, "can't roll on " .. item.type:lower()
+	end
+	local group = fits[1].mod.group
+	for _, c in ipairs(fits) do
+		if c.mod.group ~= group then return nil, "ambiguous: matches several mod groups, give the full mod text" end
+	end
+	table.sort(fits, function(a, b)
+		if a.mod.level ~= b.mod.level then return a.mod.level > b.mod.level end
+		return tostring(a.id) < tostring(b.id)
+	end)
+	for i, c in ipairs(fits) do
+		c.tier, c.allowed, c.crafted = i, crafted or c.mod.level <= ctx.ilvl, crafted
+	end
+	return fits
+end
+
+local function allowedTiers(tiers)
+	local list = {}
+	for _, t in ipairs(tiers) do
+		if t.allowed then list[#list + 1] = t end
+	end
+	return list
+end
+
+-- Turns one requested mod into a pick ({ id, mod, tier, tiers, range, crafted }), or nil and the rejection reason.
+local function resolveRequest(ctx, req)
+	local text = tostring(req.text or "")
+	local tiers, why = findTiers(ctx, requestTemplate(text), req.crafted)
+	if not tiers then return nil, why end
+	local list = allowedTiers(tiers)
+	if #list == 0 then return nil, "needs item level " .. tiers[#tiers].mod.level .. " (item level is " .. ctx.ilvl .. ")" end
+	local chosen
+	if req.tier then
+		chosen = tiers[tonumber(req.tier)]
+		if not chosen then return nil, "tier " .. tostring(req.tier) .. " doesn't exist (" .. #tiers .. " tiers)" end
+		if not chosen.allowed then return nil, "tier " .. chosen.tier .. " needs item level " .. chosen.mod.level end
+	end
+	local range = parseRoll(req.roll or ctx.spec.roll)
+	if not range then return nil, "roll must be max, mid, min or a number from 0 to 1" end
+	-- A number in the text picks the tier whose range contains it, rolled to exactly that value
+	local value = not text:find("%(") and #list[1].mod == 1 and tonumber(text:match("%-?%d+%.?%d*")) or nil
+	if value then
+		local found
+		for _, t in ipairs(chosen and { chosen } or list) do
+			local lo, hi = t.mod[1]:match("%((%-?[%d%.]+)%-(%-?[%d%.]+)%)")
+			lo, hi = tonumber(lo), tonumber(hi)
+			if lo and hi and value >= math.min(lo, hi) and value <= math.max(lo, hi) then
+				found, range = t, hi == lo and 0.5 or math.floor((value - lo) / (hi - lo) * 10000 + 0.5) / 10000
+				break
+			end
+		end
+		if not found or rolledValue(found.mod, range) ~= value then return nil, "no tier rolls " .. value .. " on this base" end
+		chosen = found
+	end
+	chosen = chosen or list[1]
+	return { id = chosen.id, mod = chosen.mod, tier = chosen.tier, tiers = #tiers, range = range, crafted = req.crafted }
+end
+
+-- Trade stat text and the lowest value for each mod line: the tier's floor, so the query finds items like the design
+-- rather than only ones rolled as high as it.
+local function tradeMods(pick)
+	local out = {}
+	for _, line in ipairs(pick.mod) do
+		local sum, n = 0, 0
+		for lo, hi in line:gmatch("%((%-?[%d%.]+)%-(%-?[%d%.]+)%)") do sum, n = sum + math.min(tonumber(lo), tonumber(hi)), n + 1 end
+		if n == 0 then
+			for v in line:gmatch("%-?%d+%.?%d*") do sum, n = sum + tonumber(v), n + 1 end
+		end
+		local text = line:gsub("%(%-?[%d%.]+%-%-?[%d%.]+%)", "#"):gsub("%-?%d+%.?%d*", "#")
+		out[#out + 1] = { text = text, min = n > 0 and sum / n or nil, type = pick.crafted and "crafted" or nil }
+	end
+	return out
+end
+
+local function buildDesign(ctx, picks)
+	local item = newRare(ctx.spec, ctx.ilvl)
+	local crafted
+	local slots = { Prefix = item.prefixes, Suffix = item.suffixes }
+	local filled = { Prefix = 0, Suffix = 0 }
+	for _, pick in ipairs(picks) do
+		if pick.crafted then
+			crafted = pick
+		else
+			local kind = pick.mod.type
+			filled[kind] = filled[kind] + 1
+			slots[kind][filled[kind]] = { modId = pick.id, range = pick.range }
+		end
+	end
+	item:Craft()
+	if crafted then
+		for _, line in ipairs(crafted.mod) do
+			item.explicitModLines[#item.explicitModLines + 1] = { line = line, modTags = crafted.mod.modTags or {}, range = crafted.range,
+				crafted = true, prefix = crafted.mod.type == "Prefix" or nil, suffix = crafted.mod.type == "Suffix" or nil }
+		end
+		item:BuildAndParseRaw()
+	end
+	local text = item:BuildRaw()
+	if not new("Item"):Item(text).base then error("the built item doesn't parse", 0) end
+	local influences = {}
+	for _, name in ipairs(ctx.spec.influences or {}) do influences[#influences + 1] = tostring(name):lower() end
+	-- The trade site knows "Two-Toned Boots", not PoB's "Two-Toned Boots (Armour/Energy Shield)"
+	local query = { base = (item.baseName:gsub(" %(.-%)$", "")), influences = #influences > 0 and influences or nil, mods = {} }
+	local mods, modLines = {}, {}
+	for _, pick in ipairs(picks) do
+		local lines = {}
+		for i, line in ipairs(pick.mod) do
+			lines[i] = itemLib.applyRange(line, pick.range)
+			modLines[#modLines + 1] = lines[i]
+		end
+		mods[#mods + 1] = { affix = (pick.crafted and "crafted " or "") .. pick.mod.type:lower(), text = table.concat(lines, " / "),
+			tier = not pick.crafted and ("T" .. pick.tier .. " of " .. pick.tiers) or nil, group = pick.mod.group }
+		for _, m in ipairs(tradeMods(pick)) do query.mods[#query.mods + 1] = m end
+	end
+	return { item = text, base = item.baseName, ilvl = ctx.ilvl, influences = query.influences, mods = mods, modLines = modLines, tradeQuery = query }
+end
+
+local function slotCheck(b, slotName, ctx)
+	local slot = b.itemsTab.slots[slotName]
+	if not slot then return "unknown slot " .. tostring(slotName) end
+	if not b.itemsTab:IsItemValidForSlot(ctx.item, slot.slotName) then return ctx.item.baseName .. " can't go in " .. slot.slotName end
+end
+
+function methods.design_rare(p)
+	if type(p.base) ~= "string" then return { error = "base required" } end
+	local b = env().build
+	local ctx, err = newContext(p)
+	if not ctx then return { error = err } end
+	if p.implicit then
+		local variants = implicitVariants(ctx.item.baseName)
+		if not isValueInArray(variants, p.implicit) then return { error = "implicit must be one of: " .. table.concat(variants, "; ") } end
+	end
+	if p.slot then
+		if not b then return { error = "no build loaded" } end
+		local bad = slotCheck(b, p.slot, ctx)
+		if bad then return { error = bad } end
+	end
+	local picks, rejected, used, count = {}, {}, {}, { Prefix = 0, Suffix = 0 }
+	local craftedReqs = {}
+	local function reject(req, reason) rejected[#rejected + 1] = { mod = req.text, reason = reason } end
+	for _, entry in ipairs(p.mods or {}) do
+		local req = type(entry) == "table" and entry or { text = entry }
+		if req.crafted then
+			craftedReqs[#craftedReqs + 1] = req
+		else
+			local pick, why = resolveRequest(ctx, req)
+			if not pick then
+				reject(req, why)
+			elseif used[pick.mod.group] then
+				reject(req, "same mod group as '" .. used[pick.mod.group] .. "' (one mod per group)")
+			elseif count[pick.mod.type] >= ctx.limit[pick.mod.type] then
+				reject(req, ordinal(count[pick.mod.type] + 1) .. " " .. pick.mod.type:lower() .. " (the item has " .. ctx.limit[pick.mod.type] .. ")")
+			else
+				used[pick.mod.group] = req.text
+				count[pick.mod.type] = count[pick.mod.type] + 1
+				picks[#picks + 1] = pick
+			end
+		end
+	end
+	for i, req in ipairs(craftedReqs) do
+		local pick, why = resolveRequest(ctx, req)
+		if i > 1 then
+			reject(req, "only one crafted modifier per item")
+		elseif not pick then
+			reject(req, why)
+		elseif used[pick.mod.group] then
+			reject(req, "same mod group as '" .. used[pick.mod.group] .. "' (one mod per group)")
+		elseif count[pick.mod.type] >= ctx.limit[pick.mod.type] then
+			reject(req, "no open " .. pick.mod.type:lower() .. " for a crafted mod")
+		else
+			count[pick.mod.type] = count[pick.mod.type] + 1
+			picks[#picks + 1] = pick
+		end
+	end
+	if #rejected > 0 then return { rejected = rejected, note = "nothing was built; fix or drop the rejected mods" } end
+	local ok, design = pcall(buildDesign, ctx, picks)
+	if not ok then return { error = tostring(design) } end
+	design.open = { prefixes = ctx.limit.Prefix - count.Prefix, suffixes = ctx.limit.Suffix - count.Suffix }
+	if p.slot then design.change = { equip = { slot = p.slot, item = design.item } } end
+	return design
+end
+
+local function equipChanges(items)
+	local changes = {}
+	for i, it in ipairs(items) do changes[i] = { equip = { slot = it.slot, item = it.item } } end
+	return changes
+end
+
+local ELEMENTS = { "Fire", "Cold", "Lightning" }
+
+-- Resistance an implicit line gives at its mid roll, per element.
+local function implicitResists(line)
+	local out = { Fire = 0, Cold = 0, Lightning = 0 }
+	local value = tonumber(itemLib.applyRange(line, 0.5):match("%-?%d+%.?%d*"))
+	if not value or not line:find("Resistance") then return out end
+	for _, elem in ipairs(ELEMENTS) do
+		if line:find(elem) or line:find("all Elemental") then out[elem] = value end
+	end
+	return out
+end
+
+local function spendFor(p, ctx)
+	if p.spend then return p.spend end
+	local spend = { "+# to maximum Life", "+# to Strength" }
+	if ctx.item.type == "Boots" then table.insert(spend, 1, "#% increased Movement Speed") end
+	return spend
+end
+
+-- Places resist suffixes across all states at once, most open slot first. `sparing` keeps each item's spend suffixes
+-- free. Nothing in `states` is changed; returns the picks per state and the resistance left uncovered.
+local function planResists(states, gaps, sparing)
+	local plan, left = {}, {}
+	for i, state in ipairs(states) do
+		plan[i] = { picks = {}, used = {}, suffixes = 0 }
+	end
+	for elem, gap in pairs(gaps) do left[elem] = gap end
+	for _, elem in ipairs(ELEMENTS) do
+		while left[elem] > 0 do
+			local best
+			for i, state in ipairs(states) do
+				local room = state.ctx.limit.Suffix - plan[i].suffixes - (sparing and state.reserve or 0)
+				local tiers = room > 0 and state.tiers[elem] or nil
+				if tiers and not plan[i].used[tiers[1].mod.group] and (not best or room > best.room) then best = { i = i, room = room, tiers = tiers } end
+			end
+			if not best then break end
+			local list = allowedTiers(best.tiers)
+			local pick = math.min(PROPOSAL_TIER, #list)
+			-- Tier 2 unless only a small remainder is left, which a lower tier covers
+			for i = pick, #list do
+				if rolledValue(list[i].mod, PROPOSAL_ROLL) >= left[elem] then pick = i end
+			end
+			left[elem] = left[elem] - rolledValue(list[pick].mod, PROPOSAL_ROLL)
+			local entry = plan[best.i]
+			entry.picks[#entry.picks + 1] = { id = list[pick].id, mod = list[pick].mod, tier = list[pick].tier, tiers = #best.tiers, range = PROPOSAL_ROLL }
+			entry.used[list[pick].mod.group] = true
+			entry.suffixes = entry.suffixes + 1
+		end
+	end
+	local short = 0
+	for _, g in pairs(left) do short = short + math.max(g, 0) end
+	return plan, short
+end
+
+function methods.fill_resists(p)
+	local b = env().build
+	if not b then return { error = "no build loaded" } end
+	if type(p.slots) ~= "table" or #p.slots == 0 then return { error = "slots required" } end
+	if #p.slots > MAX_FILL_SLOTS then return { error = "at most " .. MAX_FILL_SLOTS .. " slots" } end
+	local states, bare = {}, {}
+	for i, slotName in ipairs(p.slots) do
+		local slot = b.itemsTab.slots[slotName]
+		if not slot then return { error = "unknown slot " .. tostring(slotName) } end
+		local current = b.itemsTab.items[slot.selItemId]
+		local baseName = (p.bases or {})[slotName] or current and current.baseName
+		if not baseName then return { error = slotName .. " is empty: give its base in `bases`" } end
+		local ctx, err = newContext({ base = baseName, ilvl = p.ilvl })
+		if not ctx then return { error = slotName .. ": " .. err } end
+		local bad = slotCheck(b, slotName, ctx)
+		if bad then return { error = bad } end
+		local variants = implicitVariants(ctx.item.baseName)
+		-- Start from the implicit the slot has now, if it is one of the base's variants
+		local currentImplicit = current and current.baseName == ctx.item.baseName and current.implicitModLines[1] and current.implicitModLines[1].line
+		for _, v in ipairs(variants) do
+			if v == currentImplicit then ctx.spec.implicit = v end
+		end
+		ctx.spec.implicit = ctx.spec.implicit or variants[1]
+		local state = { slot = slotName, ctx = ctx, variants = variants, spend = spendFor(p, ctx), tiers = {}, reserve = 0 }
+		for _, elem in ipairs(ELEMENTS) do state.tiers[elem] = findTiers(ctx, requestTemplate(RESIST_TEXT[elem])) end
+		for _, text in ipairs(state.spend) do
+			local tiers = findTiers(ctx, requestTemplate(text))
+			if tiers and tiers[1].mod.type == "Suffix" then state.reserve = state.reserve + 1 end
+		end
+		states[i] = state
+		bare[i] = { slot = slotName, item = buildDesign(ctx, {}).item }
+	end
+	local want = p.stats or VARIANT_STATS
+	local before = variantRow(b, { name = "current" }, want)
+	local open = variantRow(b, { name = "bare bases", changes = equipChanges(bare) }, want)
+	if before.error or open.error then return { error = before.error or open.error } end
+
+	-- Resistance still needed with no implicit at all, so any combination of implicit variants can be tried
+	local gaps = {}
+	for _, elem in ipairs(ELEMENTS) do
+		gaps[elem] = -open.raw[elem .. "ResistOverCap"] + (open.raw["Missing" .. elem .. "Resist"] or 0)
+	end
+	for _, state in ipairs(states) do
+		for elem, v in pairs(implicitResists(state.ctx.spec.implicit)) do gaps[elem] = gaps[elem] + v end
+	end
+	-- Best implicit variants: no resist short, then no spend stat given up, then the fewest resist mods
+	local best
+	local choice = {}
+	local function search(i)
+		if i > #states then
+			local g = {}
+			for elem, v in pairs(gaps) do g[elem] = v end
+			for _, line in ipairs(choice) do
+				for elem, v in pairs(implicitResists(line)) do g[elem] = g[elem] - v end
+			end
+			for _, sparing in ipairs({ true, false }) do
+				local plan, short = planResists(states, g, sparing)
+				local used = 0
+				for _, e in ipairs(plan) do used = used + #e.picks end
+				local score = { short, sparing and 0 or 1, used }
+				local better = not best
+				if best then
+					for k = 1, 3 do
+						if score[k] ~= best.score[k] then better = score[k] < best.score[k] break end
+					end
+				end
+				if better then best = { score = score, plan = plan, choice = { unpack(choice) } } end
+				if short == 0 then break end
+			end
+			return
+		end
+		for _, line in ipairs(states[i].variants) do
+			choice[i] = line
+			search(i + 1)
+		end
+	end
+	search(1)
+
+	local warnings, notes = {}, {}
+	if best.score[1] > 0 then warnings[#warnings + 1] = string.format("%d points of resistance can't be covered with the open suffixes", best.score[1]) end
+	local items = {}
+	for i, state in ipairs(states) do
+		state.ctx.spec.implicit = best.choice[i]
+		local picks, used, count = best.plan[i].picks, best.plan[i].used, { Prefix = 0, Suffix = #best.plan[i].picks }
+		for _, text in ipairs(state.spend) do
+			local tiers = findTiers(state.ctx, requestTemplate(text))
+			local list = tiers and allowedTiers(tiers) or {}
+			local first = list[1]
+			if not first then
+				notes[#notes + 1] = state.slot .. ": " .. text .. " can't roll here"
+			elseif used[first.mod.group] or count[first.mod.type] >= state.ctx.limit[first.mod.type] then
+				notes[#notes + 1] = state.slot .. ": no open " .. first.mod.type:lower() .. " for " .. text
+			else
+				local tier = list[math.min(PROPOSAL_TIER, #list)]
+				picks[#picks + 1] = { id = tier.id, mod = tier.mod, tier = tier.tier, tiers = #tiers, range = PROPOSAL_ROLL }
+				used[first.mod.group] = true
+				count[first.mod.type] = count[first.mod.type] + 1
+			end
+		end
+		local design = buildDesign(state.ctx, picks)
+		design.slot = state.slot
+		design.implicit = best.choice[i]
+		design.change = { equip = { slot = state.slot, item = design.item } }
+		design.open = { prefixes = state.ctx.limit.Prefix - count.Prefix, suffixes = state.ctx.limit.Suffix - count.Suffix }
+		items[i] = design
+	end
+	local variant = { name = "fill_resists", changes = equipChanges(items) }
+	local after = variantRow(b, variant, want)
+	if after.error then return { error = after.error } end
+	local resists = {}
+	for _, elem in ipairs(ELEMENTS) do
+		local missing = after.raw["Missing" .. elem .. "Resist"] or 0
+		resists[elem] = { total = after.raw[elem .. "ResistTotal"], cap = after.raw[elem .. "ResistTotal"] - after.raw[elem .. "ResistOverCap"], capped = missing == 0 }
+		if missing > 0 then warnings[#warnings + 1] = string.format("%s resistance ends %d below its cap", elem, missing) end
+	end
+	for _, w in ipairs(after.warnings or {}) do warnings[#warnings + 1] = w end
+	local delta = {}
+	for _, k in ipairs(want) do
+		if type(before.raw[k]) == "number" and type(after.raw[k]) == "number" then delta[k] = jsonNumber(after.raw[k] - before.raw[k]) end
+	end
+	pcall(recalc, b)
+	b:RefreshStatList()
+	return { items = items, variant = variant, resists = resists, before = before.stats, after = after.stats, delta = delta,
+		feasible = after.feasible, warnings = warnings, unsourcedConfig = after.unsourcedConfig, notes = #notes > 0 and notes or nil }
 end
 
 -- Chat: the in-app Agent tab queues user messages here; an external agent long-polls chat_wait and answers
@@ -1156,6 +2220,523 @@ end
 
 function methods.chat_history()
 	return { messages = chat().messages, build = buildName() }
+end
+
+-- Passive tree optimiser: a greedy add/swap search on a copy of the active tree. Candidates are scored with the misc
+-- calculator's addNodes/removeNodes overrides, so the spec is only rebuilt when a move is kept. The search runs in
+-- slices from a deferred result so PoB keeps drawing and the chat panel can show its progress.
+local OPT_SLICE = 0.4
+local OPT_TIME = 20
+local OPT_MOVE_ADDS = 6
+local OPT_BREADTH = 15
+
+local function nodeTypes(node)
+	local types = {}
+	for _, m in ipairs(node.modList or {}) do types[m.name] = true end
+	return types
+end
+
+local function nodeProvides(def, node)
+	for _, line in ipairs(node.sd or {}) do
+		line = StripEscapes(line):lower()
+		if anyFind(def.text, line) and not anyFind(def.notText, line) then return true end
+	end
+	return false
+end
+
+-- Config options that are on while no item or gem provides them, so only an allocated node can justify them.
+local function treeConfigOptions(b)
+	local input = b.configTab.configSets[b.configTab.activeConfigSetId].input
+	local have = buildSources(b)
+	local treeLines = {}
+	for _, node in pairs(b.calcsTab.mainEnv.allocNodes) do
+		for _, line in ipairs(node.sd or {}) do
+			line = StripEscapes(line):lower()
+			treeLines[line] = (treeLines[line] or 0) + 1
+		end
+	end
+	local kept = {}
+	for _, line in ipairs(have.lines) do
+		if (treeLines[line] or 0) > 0 then treeLines[line] = treeLines[line] - 1 else kept[#kept + 1] = line end
+	end
+	have.lines = kept
+	local out = {}
+	for _, opt in ipairs(configOptions()) do
+		local def = opt.var and CONFIG_SOURCES[opt.var]
+		local value = input[opt.var]
+		if def and def.text and value and value ~= 0 and not hasSource(b, opt, def, have) then
+			out[#out + 1] = { var = opt.var, def = def }
+		end
+	end
+	return out
+end
+
+local function optimizeTree(b, p, progress, pace)
+	local calcs_ = b.calcsTab.calcs
+	local tab = b.treeTab
+	local origSpec, origIndex = b.spec, tab.activeSpec
+	local tree = origSpec.tree
+	local weights = type(p.weights) == "table" and p.weights or {}
+	local wEhp, wDps = tonumber(weights.ehp) or 1, tonumber(weights.dps) or 1
+	local floor = tonumber(p.dpsFloor) or 0
+	local hops = tonumber(p.hops) or 4
+	local allowKeystones = p.allowKeystones == true
+	local budget = tonumber(p.budget) or origSpec:CountAllocNodes()
+	local t0 = os.clock()
+
+	local function score(dps, ehp)
+		local s = wEhp * math.log(math.max(ehp, 1)) + wDps * math.log(math.max(dps, 1))
+		if dps < floor then s = s - 10 - (floor - dps) / floor end
+		return s
+	end
+
+	local before = recalc(b)
+	before.SkillTotalDPS = skillTotal(b)
+	local skill = mainSkill(b)
+	local src = skill and skill.activeEffect and skill.activeEffect.srcInstance
+	local parts = src and COMBINED_PARTS[skill.activeEffect.grantedEffect.name]
+	local selectedPart = src and src.skillPart
+	local treeOptions = treeConfigOptions(b)
+	local input = b.configTab.configSets[b.configTab.activeConfigSetId].input
+	local inputSaved = {}
+	for _, opt in ipairs(treeOptions) do inputSaved[opt.var] = input[opt.var] end
+	-- Mod names that equipment and gems already provide; allocated nodes add theirs each round
+	local ownedBase = {}
+	for name, list in pairs(b.calcsTab.mainEnv.player.modDB.mods) do
+		for _, m in ipairs(list) do
+			local kind = tostring(m.source):match("^[^:]*")
+			if kind == "Item" or kind == "Skill" then ownedBase[name] = true break end
+		end
+	end
+
+	local spec = new("PassiveSpec"):PassiveSpec(b, origSpec.treeVersion)
+	spec.title = string.format("Optimized W=%.2g", wDps / wEhp)
+	spec.jewels = copyTable(origSpec.jewels)
+	spec:RestoreUndoState(origSpec:CreateUndoState())
+	spec:BuildClusterJewelGraphs()
+	table.insert(tab.specList, spec)
+	tab:SetActiveSpec(#tab.specList)
+
+	local moves, rounds, ncalcs = 0, 0, 0
+	local ok, err = pcall(function()
+		-- Nodes within `hops` of the starting tree
+		local region, frontier = {}, {}
+		for id, node in pairs(spec.allocNodes) do
+			if not node.ascendancyName and node.type ~= "ClassStart" then region[id] = true frontier[#frontier + 1] = node end
+		end
+		for _ = 1, hops do
+			local nextFrontier = {}
+			for _, node in ipairs(frontier) do
+				for _, other in ipairs(node.linked) do
+					if not region[other.id] and not other.ascendancyName and other.type ~= "ClassStart" and other.type ~= "Mastery" then
+						region[other.id] = true
+						nextFrontier[#nextFrontier + 1] = other
+					end
+				end
+			end
+			frontier = nextFrontier
+		end
+
+		local calcFunc
+		local function rebase() calcFunc = calcs_.getMiscCalculator(b) end
+		rebase()
+		local optionState = {}
+		local providesCache = setmetatable({}, { __mode = "k" })
+		local function provides(opt, node)
+			local cached = providesCache[node]
+			if not cached then cached = {} providesCache[node] = cached end
+			if cached[opt.var] == nil then cached[opt.var] = nodeProvides(opt.def, node) end
+			return cached[opt.var]
+		end
+		local function applyOptions(override)
+			local changed = false
+			for _, opt in ipairs(treeOptions) do
+				local on = false
+				for _, node in pairs(spec.allocNodes) do
+					if provides(opt, node) and not (override.removeNodes and override.removeNodes[node]) then on = true break end
+				end
+				for node in pairs(override.addNodes or {}) do
+					if provides(opt, node) then on = true end
+				end
+				if optionState[opt.var] ~= on then
+					optionState[opt.var] = on
+					input[opt.var] = on or nil
+					changed = true
+				end
+			end
+			if changed then
+				b.configTab:BuildModList()
+				rebase()
+			end
+		end
+
+		local function runPart(override, part)
+			if part then src.skillPart = part end
+			ncalcs = ncalcs + 1
+			pace()
+			return calcFunc(override, false)
+		end
+		-- Candidates are screened on the biggest part of a combined skill, scaled by its share of the total
+		local topPart, topShare = nil, 1
+		if parts then
+			applyOptions({})
+			local byPart, total = {}, 0
+			for _, part in ipairs(parts) do
+				byPart[part] = runPart({}, part).CombinedDPS or 0
+				total = total + byPart[part]
+				if not topPart or byPart[part] > byPart[topPart] then topPart = part end
+			end
+			topShare = total > 0 and byPart[topPart] / total or 1
+		end
+		local function evaluate(override, full)
+			applyOptions(override)
+			local out = runPart(override, topPart)
+			local dps = out.CombinedDPS or 0
+			if parts then
+				if full then
+					for _, part in ipairs(parts) do
+						if part ~= topPart then dps = dps + (runPart(override, part).CombinedDPS or 0) end
+					end
+				else
+					dps = dps / topShare
+				end
+			end
+			if #unpayable(out) > 0 then return -1e9, 0, out.TotalEHP or 0 end
+			return score(dps, out.TotalEHP or 1), dps, out.TotalEHP or 1
+		end
+
+		local function usedPoints() return (spec:CountAllocNodes()) end
+		local function removable(node)
+			return not (node.ascendancyName or node.type == "ClassStart" or node.type == "AscendClassStart" or node.type == "Socket"
+				or node.expansionJewel or node.type == "Keystone" and not allowKeystones)
+		end
+		local function masteryNode(node, effectId)
+			local pseudo = { id = node.id, type = node.type, name = node.name, sd = { }, group = node.group, pseudoEffect = effectId }
+			for i, line in ipairs(tree.masteryEffects[effectId].sd or { }) do pseudo.sd[i] = line end
+			tree:ProcessStats(pseudo)
+			return pseudo
+		end
+
+		-- Single additions (with the path to them), and for each mod name the build has none of, every addition with it
+		local function candidates(owned)
+			local singles, groups = {}, {}
+			local groupAllocated, effectTaken = {}, {}
+			for id, node in pairs(spec.allocNodes) do
+				if node.type == "Mastery" then effectTaken[spec.masterySelections[id]] = id
+				elseif node.group then groupAllocated[node.group] = true end
+			end
+			for id, node in pairs(spec.nodes) do
+				if node.type == "Mastery" then
+					if node.masteryEffects and groupAllocated[node.group] and not node.ascendancyName then
+						for _, me in ipairs(node.masteryEffects) do
+							if not effectTaken[me.effect] then
+								singles[#singles + 1] = { nodes = { [masteryNode(node, me.effect)] = true }, remove = node.alloc and { [node] = true } or nil,
+									cost = node.alloc and 0 or 1, label = node.dn }
+							end
+						end
+					end
+				elseif not node.alloc and node.path and #node.path > 0 and #node.path <= hops and region[id] and node.group
+					and node.type ~= "Socket" and node.type ~= "ClassStart" and node.type ~= "AscendClassStart"
+					and not node.ascendancyName and not node.expansionJewel and (node.type ~= "Keystone" or allowKeystones) then
+					local set, cost, inRegion = {}, 0, true
+					for _, step in ipairs(node.path) do
+						if not region[step.id] or step.expansionJewel then inRegion = false end
+						set[step] = true
+						cost = cost + 1
+					end
+					local types = nodeTypes(node)
+					local isNew = false
+					for name in pairs(types) do
+						if not owned[name] then
+							isNew = true
+							groups[name] = groups[name] or { name = name, nodes = {} }
+							for step in pairs(set) do groups[name].nodes[step] = true end
+						end
+					end
+					if inRegion and not isNew and next(types) then
+						singles[#singles + 1] = { nodes = set, cost = cost, label = node.dn }
+					end
+				end
+			end
+			return singles, groups
+		end
+
+		-- Whether the tree left by a move is legal: within budget, connected, each mastery effect taken at most once,
+		-- and every mastery in a group that still has an allocated node
+		local function legal(addSet, remSet)
+			local final, net, masteries = {}, 0, {}
+			for _, node in pairs(spec.allocNodes) do
+				if not remSet[node] then final[node.id] = node end
+			end
+			for _ in pairs(remSet) do net = net - 1 end
+			for node in pairs(addSet) do
+				net = net + 1
+				if node.pseudoEffect then masteries[#masteries + 1] = node else final[node.id] = node end
+			end
+			if usedPoints() + net > budget then return false end
+			local groupAllocated, needed = {}, 0
+			for id, node in pairs(final) do
+				if node.type == "Mastery" then masteries[#masteries + 1] = node
+				elseif node.group then groupAllocated[node.group] = true end
+				if node.type ~= "Mastery" and node.type ~= "ClassStart" and not node.ascendancyName and id < 65536 then needed = needed + 1 end
+			end
+			local effects = {}
+			for _, node in ipairs(masteries) do
+				local effect = node.pseudoEffect or spec.masterySelections[node.id]
+				if effects[effect] or not groupAllocated[node.group] then return false end
+				effects[effect] = true
+			end
+			local start = spec.nodes[spec.curClass.startNodeId]
+			local seen, queue, reached, qi = { [start.id] = true }, { start }, 0, 1
+			while queue[qi] do
+				for _, other in ipairs(queue[qi].linked) do
+					if not seen[other.id] and final[other.id] and not other.ascendancyName and other.type ~= "Mastery" then
+						seen[other.id] = true
+						queue[#queue + 1] = other
+						if other.id < 65536 then reached = reached + 1 end
+					end
+				end
+				qi = qi + 1
+			end
+			return reached == needed
+		end
+
+		local function commit(adds, remSet)
+			local state = spec:CreateUndoState()
+			local hash, removed = {}, {}
+			for node in pairs(remSet) do removed[node.id] = true end
+			for _, id in ipairs(state.hashList) do
+				if not removed[id] then hash[#hash + 1] = id end
+			end
+			for id in pairs(removed) do
+				state.masteryEffects[id] = nil
+				state.hashOverrides[id] = nil
+			end
+			for _, a in ipairs(adds) do
+				for node in pairs(a.nodes) do
+					if node.pseudoEffect then
+						state.masteryEffects[node.id] = node.pseudoEffect
+						hash[#hash + 1] = node.id
+					else
+						hash[#hash + 1] = node.id
+					end
+				end
+			end
+			state.hashList = hash
+			spec:RestoreUndoState(state)
+			rebase()
+			optionState = {}
+		end
+
+		local function union(a, b_)
+			local t = {}
+			for k in pairs(a or {}) do t[k] = true end
+			for k in pairs(b_ or {}) do t[k] = true end
+			return t
+		end
+
+		local bestScore, bestDps, bestEhp = evaluate({}, true)
+		progress(string.format("Optimizing the tree: starting at %.0f DPS, %.0f EHP with %d of %d points", bestDps, bestEhp, usedPoints(), budget))
+		local deadline = t0 + OPT_TIME
+		while os.clock() < deadline do
+			rounds = rounds + 1
+			local owned = {}
+			for name in pairs(ownedBase) do owned[name] = true end
+			for _, node in pairs(spec.allocNodes) do
+				for name in pairs(nodeTypes(node)) do owned[name] = true end
+			end
+			local roundBase = evaluate({}, false)
+			local singles, groups = candidates(owned)
+			local bestRatio = 0
+			for _, c in ipairs(singles) do
+				c.gain = evaluate({ addNodes = c.nodes, removeNodes = c.remove }, false) - roundBase
+				c.ratio = c.cost > 0 and c.gain / c.cost or c.gain * 1e9
+				if c.cost > 0 and c.ratio > bestRatio then bestRatio = c.ratio end
+			end
+			table.sort(singles, function(x, y) return x.ratio > y.ratio end)
+			-- A stat the build has none of is only worth taking all together, and only if that beats the best single use of the points
+			local packages = {}
+			for _, g in ipairs(groups) do
+				local cost = 0
+				for _ in pairs(g.nodes) do cost = cost + 1 end
+				local gain = evaluate({ addNodes = g.nodes }, false) - roundBase
+				if gain > 0 and gain / cost > bestRatio then
+					packages[#packages + 1] = { nodes = g.nodes, cost = cost, ratio = gain / cost, gain = gain, label = g.name }
+				end
+			end
+			table.sort(packages, function(x, y) return x.ratio > y.ratio end)
+
+			local drops = {}
+			for _, node in pairs(spec.allocNodes) do
+				if removable(node) then
+					local set, count, whole = {}, 0, true
+					for _, dep in ipairs(node.depends or { node }) do
+						if dep.alloc and not set[dep] then
+							set[dep] = true
+							count = count + 1
+							whole = whole and removable(dep)
+						end
+					end
+					if whole and count > 0 then
+						local loss = roundBase - evaluate({ removeNodes = set }, false)
+						drops[#drops + 1] = { nodes = set, freed = count, ratio = loss / count }
+					end
+				end
+			end
+			table.sort(drops, function(x, y) return x.ratio < y.ratio end)
+
+			local free = budget - usedPoints()
+			local best
+			local function try(adds, remSet, label)
+				local addSet, remAll = {}, union(remSet)
+				for _, a in ipairs(adds) do
+					addSet = union(addSet, a.nodes)
+					remAll = union(remAll, a.remove)
+				end
+				for node in pairs(addSet) do
+					if remAll[node] then return end
+				end
+				if not legal(addSet, remAll) then return end
+				local s, dps, ehp = evaluate({ addNodes = addSet, removeNodes = remAll }, true)
+				if not best or s > best.score then best = { score = s, dps = dps, ehp = ehp, adds = adds, rem = remAll, label = label } end
+			end
+			local function pack(points, remSet, lead)
+				local picked, taken, cost = {}, {}, 0
+				local function take(c)
+					picked[#picked + 1] = c
+					for node in pairs(c.nodes) do taken[node] = true end
+					cost = cost + c.cost
+				end
+				if lead then take(lead) end
+				for _, c in ipairs(singles) do
+					if #picked >= OPT_MOVE_ADDS or c.gain <= 0 then break end
+					if cost + c.cost <= points then
+						local clash = false
+						for node in pairs(c.nodes) do
+							if taken[node] or remSet and remSet[node] then clash = true end
+						end
+						if not clash then take(c) end
+					end
+				end
+				return picked
+			end
+
+			if free > 0 then
+				local picked = pack(free, nil)
+				if #picked > 0 then try(picked, nil, "fill") end
+			end
+			for i = 1, math.min(OPT_BREADTH, #drops) do
+				local picked = pack(free + drops[i].freed, drops[i].nodes)
+				if #picked > 0 then try(picked, drops[i].nodes, singles[1].label) end
+			end
+			local leads = {}
+			for i = 1, math.min(OPT_BREADTH, #singles) do
+				if singles[i].gain > 0 then leads[#leads + 1] = singles[i] end
+			end
+			for i = 1, math.min(3, #packages) do leads[#leads + 1] = packages[i] end
+			for _, lead in ipairs(leads) do
+				local need = lead.cost - free
+				local remSet, freed = {}, 0
+				for _, d in ipairs(drops) do
+					if freed >= need then break end
+					local clash = false
+					for node in pairs(d.nodes) do
+						if lead.nodes[node] or remSet[node] then clash = true end
+					end
+					if not clash then
+						remSet = union(remSet, d.nodes)
+						freed = freed + d.freed
+					end
+				end
+				if freed >= need then try(pack(free + freed, remSet, lead), remSet, lead.label) end
+			end
+
+			if not best or best.score <= bestScore + 1e-4 then break end
+			bestScore = best.score
+			moves = moves + 1
+			commit(best.adds, best.rem)
+			progress(string.format("Optimizing the tree, round %d: %s, now %.0f DPS, %.0f EHP with %d of %d points", rounds, best.label, best.dps, best.ehp, usedPoints(), budget))
+		end
+	end)
+	for var, value in pairs(inputSaved) do input[var] = value end
+	if src then src.skillPart = selectedPart end
+	b.configTab:BuildModList()
+	local function discard()
+		for i = #tab.specList, 1, -1 do
+			if tab.specList[i] == spec then table.remove(tab.specList, i) end
+		end
+		tab:SetActiveSpec(origIndex)
+	end
+	if not ok then
+		discard()
+		error(err, 0)
+	end
+	if moves == 0 then
+		discard()
+		recalc(b)
+		return { improved = false, rounds = rounds, seconds = os.clock() - t0, note = "No legal change beat the current tree under these weights, floor and budget, so no tree was added." }
+	end
+
+	local after = recalc(b)
+	local components
+	after.SkillTotalDPS, components = skillTotal(b)
+	local unsourced = unsourcedConfig(b, after)
+	local warnings, feasible = setupWarnings(b, after)
+	addConfigWarnings(warnings, unsourced)
+	local function summary(stats)
+		return { dps = jsonNumber(stats.SkillTotalDPS), ehp = jsonNumber(stats.TotalEHP), life = jsonNumber(stats.Life),
+			score = jsonNumber(score(stats.SkillTotalDPS or 0, stats.TotalEHP or 1)) }
+	end
+	local added, removed, masteryChanges = {}, {}, {}
+	for id, node in pairs(spec.allocNodes) do
+		if not origSpec.allocNodes[id] and node.type ~= "Mastery" then added[#added + 1] = node.dn end
+	end
+	for id, node in pairs(origSpec.allocNodes) do
+		if not spec.allocNodes[id] and node.type ~= "Mastery" then removed[#removed + 1] = node.dn end
+	end
+	table.sort(added)
+	table.sort(removed)
+	local function effectText(effectId)
+		local effect = effectId and tree.masteryEffects[effectId]
+		return effect and table.concat(effect.sd or {}, " / ")
+	end
+	local seenMastery = {}
+	for _, selections in ipairs({ spec.masterySelections, origSpec.masterySelections }) do
+		for id, effectId in pairs(selections) do
+			if not seenMastery[id] then
+				seenMastery[id] = true
+				local was, now = origSpec.masterySelections[id], spec.masterySelections[id]
+				if was ~= now then
+					masteryChanges[#masteryChanges + 1] = { mastery = spec.nodes[id].name, from = effectText(was), to = effectText(now) }
+				end
+			end
+		end
+	end
+	local used = spec:CountAllocNodes()
+	return { improved = true, spec = spec.title, specIndex = #tab.specList, originalSpec = origSpec.title or "Default",
+		pointsUsed = used, budget = budget, added = added, removed = removed, masteryChanges = masteryChanges,
+		before = summary(before), after = summary(after), dpsFloorMet = (after.SkillTotalDPS or 0) >= floor,
+		skillTotal = { combined = components ~= nil, components = components },
+		warnings = warnings, feasible = feasible, unsourcedConfig = unsourced,
+		rounds = rounds, calcs = ncalcs, seconds = os.clock() - t0 }
+end
+
+function methods.optimize_tree(p)
+	local b = env().build
+	if not b then return { error = "no build loaded" } end
+	local c = chat()
+	local sliceEnd = 0
+	local function pace() if os.clock() >= sliceEnd then coroutine.yield() end end
+	local function progress(text)
+		if c.thinking then c.thinking.steps[#c.thinking.steps + 1] = text end
+	end
+	local co = coroutine.create(function() return optimizeTree(b, p, progress, pace) end)
+	return { _defer = function()
+		sliceEnd = os.clock() + OPT_SLICE
+		local ok, res = coroutine.resume(co)
+		if not ok then error(res, 0) end
+		if coroutine.status(co) == "dead" then return res end
+	end }
 end
 
 local function handle(line)
