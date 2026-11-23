@@ -476,6 +476,12 @@ function buildMode:Init(dbFileName, buildName, buildXML, convertBuild, importLin
 		self.viewMode = "COMPARE"
 	end)
 	self.controls.modeCompare.locked = function() return self.viewMode == "COMPARE" end
+	self.controls.modeAgent = new("ButtonControl"):ButtonControl({"LEFT",self.controls.modeCompare,"RIGHT"}, {4, 0, 72, 20}, function()
+		return self.agentPanelOpen and "Agent <<" or "Agent >>"
+	end, function()
+		self.agentPanelOpen = not self.agentPanelOpen
+	end)
+	self.controls.modeAgent.tooltipText = "Show or hide the agent chat panel."
 	-- Skills
 	self.controls.mainSkillLabel = new("LabelControl"):LabelControl({"TOPLEFT",self.anchorSideBar,"TOPLEFT"}, {0, 80, 300, 16}, "^7Main Skill:")
 	self.controls.mainSocketGroup = new("DropDownControl"):DropDownControl({"TOPLEFT",self.controls.mainSkillLabel,"BOTTOMLEFT"}, {0, 2, 300, 18}, nil, function(index, value)
@@ -607,6 +613,7 @@ function buildMode:Init(dbFileName, buildName, buildXML, convertBuild, importLin
 	self.data = data
 	self.importTab = new("ImportTab"):ImportTab(self)
 	self.notesTab = new("NotesTab"):NotesTab(self)
+	self.agentTab = new("AgentTab"):AgentTab(self)
 	self.partyTab = new("PartyTab"):PartyTab(self)
 	self.configTab = new("ConfigTab"):ConfigTab(self)
 	self.itemsTab = new("ItemsTab"):ItemsTab(self)
@@ -1297,8 +1304,15 @@ function buildMode:OnFrame(inputEvents)
 		width = main.screenW - sideBarWidth,
 		height = main.screenH - 32
 	}
+	local agentViewPort
+	if self.agentPanelOpen then
+		local panelWidth = m_min(420, m_floor(tabViewPort.width / 2))
+		tabViewPort.width = tabViewPort.width - panelWidth
+		agentViewPort = { x = tabViewPort.x + tabViewPort.width, y = tabViewPort.y, width = panelWidth, height = tabViewPort.height }
+		self.agentTab:ProcessInput(agentViewPort, inputEvents)
+	end
 	if self.viewMode == "IMPORT" then
-		self.importTab:Draw(tabViewPort, inputEvents)  
+		self.importTab:Draw(tabViewPort, inputEvents)
 	elseif self.viewMode == "NOTES" then
 		self.notesTab:Draw(tabViewPort, inputEvents)
 	elseif self.viewMode == "PARTY" then
@@ -1315,6 +1329,9 @@ function buildMode:OnFrame(inputEvents)
 		self.calcsTab:Draw(tabViewPort, inputEvents)
 	elseif self.viewMode == "COMPARE" then
 		self.compareTab:Draw(tabViewPort, inputEvents)
+	end
+	if agentViewPort then
+		self.agentTab:Draw(agentViewPort)
 	end
 
 	-- Draw overlay panes on top of all tab content (last = topmost)
