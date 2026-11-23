@@ -18,12 +18,17 @@ plus flask Maim/Hinder immunity in `ModParser.lua`/`ModCache.lua`.
 Keep these small; they are where upstream merges conflict.
 
 ## Bridge methods
-`ping, reload, restart, list_sources, search, inspect, get_state, what_if, rank_options, path_cost, parse_mod,
-list_stats, probe_batch, find_by_effect, effect_stats, import_character, eval (dev mode), chat_wait, chat_reply,
-chat_status, chat_history`. The agent's tools and their parameters are in `agent/api/tools.mjs`.
+`ping, reload, restart, list_sources, search, inspect, get_state, what_if, gem_what_if, rank_options, path_cost, compare_variants, design_rare, fill_resists, parse_mod,
+list_stats, probe_batch, find_by_effect, effect_stats, import_character, optimize_tree, eval (dev mode), chat_wait, chat_reply,
+chat_status, chat_history`. The agent's tools and their parameters are in `agent/api/tools.mjs`. Tools with `run` instead of `method` execute in the Node agent (`price_lookup` and `trade_search`, in `market.mjs`) and need no bridge; `pob_fill_resists` is one: it calls the bridge, then prices each item with `trade_search`.
 
 - `what_if` adds the mods as a temporary Config custom-mod block, recalculates, diffs `calcsTab.mainOutput` and removes
   the block. When a mod's requirements aren't met as configured, `ifConditionsMet` recalculates with them forced on.
+- `gem_what_if` adds or sets gems in a socket group, recalculates and restores it. A gem without a level gets its `naturalMaxLevel`; levels above it are marked `needsCorruption`.
+- `design_rare` builds an item through `Item:Craft` (Prefix/Suffix lines with `{range}`, bench mods as `{crafted}` lines),
+  checking each mod with `Item:CanHaveMod` and the item's affix limits, and returns the `BuildRaw` text plus a
+  `trade_search`-shaped `tradeQuery`. `fill_resists` measures the resist gaps with the bare bases equipped,
+  picks implicit variants and resist mods across the slots, spends the rest, and evaluates the result with the same `variantRow` as `compare_variants`.
 - `rank_options` runs `what_if` on every search hit and ranks by a weighted relative change of the goal stats.
 - `find_by_effect` uses the effect index: each distinct mod line probed once, keyed by the output stats it moves.
 - `chat_wait` holds the connection open until the panel has a message; the agent loop is
