@@ -49,3 +49,9 @@ agent_effects.json
 node_modules/
 agent/api/.env
 __pycache__/
+
+# macOS runtime, built from msciotti/PathOfBuilding-SimpleGraphic (macos/package.sh)
+runtime/PathOfBuilding
+runtime/*.dylib
+runtime/*.so
+runtime/SimpleGraphic/Screenshots/

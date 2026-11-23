@@ -35,7 +35,9 @@ chat_status, chat_history`. The agent's tools and their parameters are in `agent
   `chat_wait -> tools -> chat_reply`.
 
 ## Running
-- Run PoB from this tree (`runtime/Path{space}of{space}Building.exe` on Windows) with a build open.
+- Run PoB from this tree (`runtime/Path{space}of{space}Building.exe` on Windows) with a build open. On macOS, build
+  the runtime from the `macos` branch of msciotti/PathOfBuilding-SimpleGraphic (`macos/README.md` there) and run
+  `runtime/PathOfBuilding`.
 - `cd agent/api && npm install`, put `ANTHROPIC_API_KEY=...` in `agent/api/.env`, then `npm run agent` and chat in the
   Agent panel. `POB_AGENT_MODEL` and `POB_AGENT_EFFORT` are optional.
 
