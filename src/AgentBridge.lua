@@ -538,7 +538,7 @@ end
 -- `skillTypes` and `skillsFromOption` (the option's own ifSkill list) match active skills.
 local CONFIG_SOURCES = {
 	buffFortification = { text = { "fortify%f[%A]", "gain %d+ fortification", "you have your maximum fortification" },
-		notText = { "while you have fortify", "while fortified" }, gems = { "Fortify", "Vigilant Strike" } },
+		notText = { "while you have fortify", "while fortified", "kill" }, gems = { "Fortify", "Vigilant Strike" } },
 	useEnduranceCharges = chargeSource("endurance"),
 	useFrenzyCharges = chargeSource("frenzy"),
 	usePowerCharges = chargeSource("power"),
@@ -1643,6 +1643,523 @@ end
 
 function methods.chat_history()
 	return { messages = chat().messages, build = buildName() }
+end
+
+-- Passive tree optimiser: a greedy add/swap search on a copy of the active tree. Candidates are scored with the misc
+-- calculator's addNodes/removeNodes overrides, so the spec is only rebuilt when a move is kept. The search runs in
+-- slices from a deferred result so PoB keeps drawing and the chat panel can show its progress.
+local OPT_SLICE = 0.4
+local OPT_TIME = 20
+local OPT_MOVE_ADDS = 6
+local OPT_BREADTH = 15
+
+local function nodeTypes(node)
+	local types = {}
+	for _, m in ipairs(node.modList or {}) do types[m.name] = true end
+	return types
+end
+
+local function nodeProvides(def, node)
+	for _, line in ipairs(node.sd or {}) do
+		line = StripEscapes(line):lower()
+		if anyFind(def.text, line) and not anyFind(def.notText, line) then return true end
+	end
+	return false
+end
+
+-- Config options that are on while no item or gem provides them, so only an allocated node can justify them.
+local function treeConfigOptions(b)
+	local input = b.configTab.configSets[b.configTab.activeConfigSetId].input
+	local have = buildSources(b)
+	local treeLines = {}
+	for _, node in pairs(b.calcsTab.mainEnv.allocNodes) do
+		for _, line in ipairs(node.sd or {}) do
+			line = StripEscapes(line):lower()
+			treeLines[line] = (treeLines[line] or 0) + 1
+		end
+	end
+	local kept = {}
+	for _, line in ipairs(have.lines) do
+		if (treeLines[line] or 0) > 0 then treeLines[line] = treeLines[line] - 1 else kept[#kept + 1] = line end
+	end
+	have.lines = kept
+	local out = {}
+	for _, opt in ipairs(configOptions()) do
+		local def = opt.var and CONFIG_SOURCES[opt.var]
+		local value = input[opt.var]
+		if def and def.text and value and value ~= 0 and not hasSource(b, opt, def, have) then
+			out[#out + 1] = { var = opt.var, def = def }
+		end
+	end
+	return out
+end
+
+local function optimizeTree(b, p, progress, pace)
+	local calcs_ = b.calcsTab.calcs
+	local tab = b.treeTab
+	local origSpec, origIndex = b.spec, tab.activeSpec
+	local tree = origSpec.tree
+	local weights = type(p.weights) == "table" and p.weights or {}
+	local wEhp, wDps = tonumber(weights.ehp) or 1, tonumber(weights.dps) or 1
+	local floor = tonumber(p.dpsFloor) or 0
+	local hops = tonumber(p.hops) or 4
+	local allowKeystones = p.allowKeystones == true
+	local budget = tonumber(p.budget) or origSpec:CountAllocNodes()
+	local t0 = os.clock()
+
+	local function score(dps, ehp)
+		local s = wEhp * math.log(math.max(ehp, 1)) + wDps * math.log(math.max(dps, 1))
+		if dps < floor then s = s - 10 - (floor - dps) / floor end
+		return s
+	end
+
+	local before = recalc(b)
+	before.SkillTotalDPS = skillTotal(b)
+	local skill = mainSkill(b)
+	local src = skill and skill.activeEffect and skill.activeEffect.srcInstance
+	local parts = src and COMBINED_PARTS[skill.activeEffect.grantedEffect.name]
+	local selectedPart = src and src.skillPart
+	local treeOptions = treeConfigOptions(b)
+	local input = b.configTab.configSets[b.configTab.activeConfigSetId].input
+	local inputSaved = {}
+	for _, opt in ipairs(treeOptions) do inputSaved[opt.var] = input[opt.var] end
+	-- Mod names that equipment and gems already provide; allocated nodes add theirs each round
+	local ownedBase = {}
+	for name, list in pairs(b.calcsTab.mainEnv.player.modDB.mods) do
+		for _, m in ipairs(list) do
+			local kind = tostring(m.source):match("^[^:]*")
+			if kind == "Item" or kind == "Skill" then ownedBase[name] = true break end
+		end
+	end
+
+	local spec = new("PassiveSpec"):PassiveSpec(b, origSpec.treeVersion)
+	spec.title = string.format("Optimized W=%.2g", wDps / wEhp)
+	spec.jewels = copyTable(origSpec.jewels)
+	spec:RestoreUndoState(origSpec:CreateUndoState())
+	spec:BuildClusterJewelGraphs()
+	table.insert(tab.specList, spec)
+	tab:SetActiveSpec(#tab.specList)
+
+	local moves, rounds, ncalcs = 0, 0, 0
+	local ok, err = pcall(function()
+		-- Nodes within `hops` of the starting tree
+		local region, frontier = {}, {}
+		for id, node in pairs(spec.allocNodes) do
+			if not node.ascendancyName and node.type ~= "ClassStart" then region[id] = true frontier[#frontier + 1] = node end
+		end
+		for _ = 1, hops do
+			local nextFrontier = {}
+			for _, node in ipairs(frontier) do
+				for _, other in ipairs(node.linked) do
+					if not region[other.id] and not other.ascendancyName and other.type ~= "ClassStart" and other.type ~= "Mastery" then
+						region[other.id] = true
+						nextFrontier[#nextFrontier + 1] = other
+					end
+				end
+			end
+			frontier = nextFrontier
+		end
+
+		local calcFunc
+		local function rebase() calcFunc = calcs_.getMiscCalculator(b) end
+		rebase()
+		local optionState = {}
+		local providesCache = setmetatable({}, { __mode = "k" })
+		local function provides(opt, node)
+			local cached = providesCache[node]
+			if not cached then cached = {} providesCache[node] = cached end
+			if cached[opt.var] == nil then cached[opt.var] = nodeProvides(opt.def, node) end
+			return cached[opt.var]
+		end
+		local function applyOptions(override)
+			local changed = false
+			for _, opt in ipairs(treeOptions) do
+				local on = false
+				for _, node in pairs(spec.allocNodes) do
+					if provides(opt, node) and not (override.removeNodes and override.removeNodes[node]) then on = true break end
+				end
+				for node in pairs(override.addNodes or {}) do
+					if provides(opt, node) then on = true end
+				end
+				if optionState[opt.var] ~= on then
+					optionState[opt.var] = on
+					input[opt.var] = on or nil
+					changed = true
+				end
+			end
+			if changed then
+				b.configTab:BuildModList()
+				rebase()
+			end
+		end
+
+		local function runPart(override, part)
+			if part then src.skillPart = part end
+			ncalcs = ncalcs + 1
+			pace()
+			return calcFunc(override, false)
+		end
+		-- Candidates are screened on the biggest part of a combined skill, scaled by its share of the total
+		local topPart, topShare = nil, 1
+		if parts then
+			applyOptions({})
+			local byPart, total = {}, 0
+			for _, part in ipairs(parts) do
+				byPart[part] = runPart({}, part).CombinedDPS or 0
+				total = total + byPart[part]
+				if not topPart or byPart[part] > byPart[topPart] then topPart = part end
+			end
+			topShare = total > 0 and byPart[topPart] / total or 1
+		end
+		local function evaluate(override, full)
+			applyOptions(override)
+			local out = runPart(override, topPart)
+			local dps = out.CombinedDPS or 0
+			if parts then
+				if full then
+					for _, part in ipairs(parts) do
+						if part ~= topPart then dps = dps + (runPart(override, part).CombinedDPS or 0) end
+					end
+				else
+					dps = dps / topShare
+				end
+			end
+			if #unpayable(out) > 0 then return -1e9, 0, out.TotalEHP or 0 end
+			return score(dps, out.TotalEHP or 1), dps, out.TotalEHP or 1
+		end
+
+		local function usedPoints() return (spec:CountAllocNodes()) end
+		local function removable(node)
+			return not (node.ascendancyName or node.type == "ClassStart" or node.type == "AscendClassStart" or node.type == "Socket"
+				or node.expansionJewel or node.type == "Keystone" and not allowKeystones)
+		end
+		local function masteryNode(node, effectId)
+			local pseudo = { id = node.id, type = node.type, name = node.name, sd = { }, group = node.group, pseudoEffect = effectId }
+			for i, line in ipairs(tree.masteryEffects[effectId].sd or { }) do pseudo.sd[i] = line end
+			tree:ProcessStats(pseudo)
+			return pseudo
+		end
+
+		-- Single additions (with the path to them), and for each mod name the build has none of, every addition with it
+		local function candidates(owned)
+			local singles, groups = {}, {}
+			local groupAllocated, effectTaken = {}, {}
+			for id, node in pairs(spec.allocNodes) do
+				if node.type == "Mastery" then effectTaken[spec.masterySelections[id]] = id
+				elseif node.group then groupAllocated[node.group] = true end
+			end
+			for id, node in pairs(spec.nodes) do
+				if node.type == "Mastery" then
+					if node.masteryEffects and groupAllocated[node.group] and not node.ascendancyName then
+						for _, me in ipairs(node.masteryEffects) do
+							if not effectTaken[me.effect] then
+								singles[#singles + 1] = { nodes = { [masteryNode(node, me.effect)] = true }, remove = node.alloc and { [node] = true } or nil,
+									cost = node.alloc and 0 or 1, label = node.dn }
+							end
+						end
+					end
+				elseif not node.alloc and node.path and #node.path > 0 and #node.path <= hops and region[id] and node.group
+					and node.type ~= "Socket" and node.type ~= "ClassStart" and node.type ~= "AscendClassStart"
+					and not node.ascendancyName and not node.expansionJewel and (node.type ~= "Keystone" or allowKeystones) then
+					local set, cost, inRegion = {}, 0, true
+					for _, step in ipairs(node.path) do
+						if not region[step.id] or step.expansionJewel then inRegion = false end
+						set[step] = true
+						cost = cost + 1
+					end
+					local types = nodeTypes(node)
+					local isNew = false
+					for name in pairs(types) do
+						if not owned[name] then
+							isNew = true
+							groups[name] = groups[name] or { name = name, nodes = {} }
+							for step in pairs(set) do groups[name].nodes[step] = true end
+						end
+					end
+					if inRegion and not isNew and next(types) then
+						singles[#singles + 1] = { nodes = set, cost = cost, label = node.dn }
+					end
+				end
+			end
+			return singles, groups
+		end
+
+		-- Whether the tree left by a move is legal: within budget, connected, each mastery effect taken at most once,
+		-- and every mastery in a group that still has an allocated node
+		local function legal(addSet, remSet)
+			local final, net, masteries = {}, 0, {}
+			for _, node in pairs(spec.allocNodes) do
+				if not remSet[node] then final[node.id] = node end
+			end
+			for _ in pairs(remSet) do net = net - 1 end
+			for node in pairs(addSet) do
+				net = net + 1
+				if node.pseudoEffect then masteries[#masteries + 1] = node else final[node.id] = node end
+			end
+			if usedPoints() + net > budget then return false end
+			local groupAllocated, needed = {}, 0
+			for id, node in pairs(final) do
+				if node.type == "Mastery" then masteries[#masteries + 1] = node
+				elseif node.group then groupAllocated[node.group] = true end
+				if node.type ~= "Mastery" and node.type ~= "ClassStart" and not node.ascendancyName and id < 65536 then needed = needed + 1 end
+			end
+			local effects = {}
+			for _, node in ipairs(masteries) do
+				local effect = node.pseudoEffect or spec.masterySelections[node.id]
+				if effects[effect] or not groupAllocated[node.group] then return false end
+				effects[effect] = true
+			end
+			local start = spec.nodes[spec.curClass.startNodeId]
+			local seen, queue, reached, qi = { [start.id] = true }, { start }, 0, 1
+			while queue[qi] do
+				for _, other in ipairs(queue[qi].linked) do
+					if not seen[other.id] and final[other.id] and not other.ascendancyName and other.type ~= "Mastery" then
+						seen[other.id] = true
+						queue[#queue + 1] = other
+						if other.id < 65536 then reached = reached + 1 end
+					end
+				end
+				qi = qi + 1
+			end
+			return reached == needed
+		end
+
+		local function commit(adds, remSet)
+			local state = spec:CreateUndoState()
+			local hash, removed = {}, {}
+			for node in pairs(remSet) do removed[node.id] = true end
+			for _, id in ipairs(state.hashList) do
+				if not removed[id] then hash[#hash + 1] = id end
+			end
+			for id in pairs(removed) do
+				state.masteryEffects[id] = nil
+				state.hashOverrides[id] = nil
+			end
+			for _, a in ipairs(adds) do
+				for node in pairs(a.nodes) do
+					if node.pseudoEffect then
+						state.masteryEffects[node.id] = node.pseudoEffect
+						hash[#hash + 1] = node.id
+					else
+						hash[#hash + 1] = node.id
+					end
+				end
+			end
+			state.hashList = hash
+			spec:RestoreUndoState(state)
+			rebase()
+			optionState = {}
+		end
+
+		local function union(a, b_)
+			local t = {}
+			for k in pairs(a or {}) do t[k] = true end
+			for k in pairs(b_ or {}) do t[k] = true end
+			return t
+		end
+
+		local bestScore, bestDps, bestEhp = evaluate({}, true)
+		progress(string.format("Optimizing the tree: starting at %.0f DPS, %.0f EHP with %d of %d points", bestDps, bestEhp, usedPoints(), budget))
+		local deadline = t0 + OPT_TIME
+		while os.clock() < deadline do
+			rounds = rounds + 1
+			local owned = {}
+			for name in pairs(ownedBase) do owned[name] = true end
+			for _, node in pairs(spec.allocNodes) do
+				for name in pairs(nodeTypes(node)) do owned[name] = true end
+			end
+			local roundBase = evaluate({}, false)
+			local singles, groups = candidates(owned)
+			local bestRatio = 0
+			for _, c in ipairs(singles) do
+				c.gain = evaluate({ addNodes = c.nodes, removeNodes = c.remove }, false) - roundBase
+				c.ratio = c.cost > 0 and c.gain / c.cost or c.gain * 1e9
+				if c.cost > 0 and c.ratio > bestRatio then bestRatio = c.ratio end
+			end
+			table.sort(singles, function(x, y) return x.ratio > y.ratio end)
+			-- A stat the build has none of is only worth taking all together, and only if that beats the best single use of the points
+			local packages = {}
+			for _, g in ipairs(groups) do
+				local cost = 0
+				for _ in pairs(g.nodes) do cost = cost + 1 end
+				local gain = evaluate({ addNodes = g.nodes }, false) - roundBase
+				if gain > 0 and gain / cost > bestRatio then
+					packages[#packages + 1] = { nodes = g.nodes, cost = cost, ratio = gain / cost, gain = gain, label = g.name }
+				end
+			end
+			table.sort(packages, function(x, y) return x.ratio > y.ratio end)
+
+			local drops = {}
+			for _, node in pairs(spec.allocNodes) do
+				if removable(node) then
+					local set, count, whole = {}, 0, true
+					for _, dep in ipairs(node.depends or { node }) do
+						if dep.alloc and not set[dep] then
+							set[dep] = true
+							count = count + 1
+							whole = whole and removable(dep)
+						end
+					end
+					if whole and count > 0 then
+						local loss = roundBase - evaluate({ removeNodes = set }, false)
+						drops[#drops + 1] = { nodes = set, freed = count, ratio = loss / count }
+					end
+				end
+			end
+			table.sort(drops, function(x, y) return x.ratio < y.ratio end)
+
+			local free = budget - usedPoints()
+			local best
+			local function try(adds, remSet, label)
+				local addSet, remAll = {}, union(remSet)
+				for _, a in ipairs(adds) do
+					addSet = union(addSet, a.nodes)
+					remAll = union(remAll, a.remove)
+				end
+				for node in pairs(addSet) do
+					if remAll[node] then return end
+				end
+				if not legal(addSet, remAll) then return end
+				local s, dps, ehp = evaluate({ addNodes = addSet, removeNodes = remAll }, true)
+				if not best or s > best.score then best = { score = s, dps = dps, ehp = ehp, adds = adds, rem = remAll, label = label } end
+			end
+			local function pack(points, remSet, lead)
+				local picked, taken, cost = {}, {}, 0
+				local function take(c)
+					picked[#picked + 1] = c
+					for node in pairs(c.nodes) do taken[node] = true end
+					cost = cost + c.cost
+				end
+				if lead then take(lead) end
+				for _, c in ipairs(singles) do
+					if #picked >= OPT_MOVE_ADDS or c.gain <= 0 then break end
+					if cost + c.cost <= points then
+						local clash = false
+						for node in pairs(c.nodes) do
+							if taken[node] or remSet and remSet[node] then clash = true end
+						end
+						if not clash then take(c) end
+					end
+				end
+				return picked
+			end
+
+			if free > 0 then
+				local picked = pack(free, nil)
+				if #picked > 0 then try(picked, nil, "fill") end
+			end
+			for i = 1, math.min(OPT_BREADTH, #drops) do
+				local picked = pack(free + drops[i].freed, drops[i].nodes)
+				if #picked > 0 then try(picked, drops[i].nodes, singles[1].label) end
+			end
+			local leads = {}
+			for i = 1, math.min(OPT_BREADTH, #singles) do
+				if singles[i].gain > 0 then leads[#leads + 1] = singles[i] end
+			end
+			for i = 1, math.min(3, #packages) do leads[#leads + 1] = packages[i] end
+			for _, lead in ipairs(leads) do
+				local need = lead.cost - free
+				local remSet, freed = {}, 0
+				for _, d in ipairs(drops) do
+					if freed >= need then break end
+					local clash = false
+					for node in pairs(d.nodes) do
+						if lead.nodes[node] or remSet[node] then clash = true end
+					end
+					if not clash then
+						remSet = union(remSet, d.nodes)
+						freed = freed + d.freed
+					end
+				end
+				if freed >= need then try(pack(free + freed, remSet, lead), remSet, lead.label) end
+			end
+
+			if not best or best.score <= bestScore + 1e-4 then break end
+			bestScore = best.score
+			moves = moves + 1
+			commit(best.adds, best.rem)
+			progress(string.format("Optimizing the tree, round %d: %s, now %.0f DPS, %.0f EHP with %d of %d points", rounds, best.label, best.dps, best.ehp, usedPoints(), budget))
+		end
+	end)
+	for var, value in pairs(inputSaved) do input[var] = value end
+	if src then src.skillPart = selectedPart end
+	b.configTab:BuildModList()
+	local function discard()
+		for i = #tab.specList, 1, -1 do
+			if tab.specList[i] == spec then table.remove(tab.specList, i) end
+		end
+		tab:SetActiveSpec(origIndex)
+	end
+	if not ok then
+		discard()
+		error(err, 0)
+	end
+	if moves == 0 then
+		discard()
+		recalc(b)
+		return { improved = false, rounds = rounds, seconds = os.clock() - t0, note = "No legal change beat the current tree under these weights, floor and budget, so no tree was added." }
+	end
+
+	local after = recalc(b)
+	local components
+	after.SkillTotalDPS, components = skillTotal(b)
+	local unsourced = unsourcedConfig(b, after)
+	local warnings, feasible = setupWarnings(b, after)
+	addConfigWarnings(warnings, unsourced)
+	local function summary(stats)
+		return { dps = jsonNumber(stats.SkillTotalDPS), ehp = jsonNumber(stats.TotalEHP), life = jsonNumber(stats.Life),
+			score = jsonNumber(score(stats.SkillTotalDPS or 0, stats.TotalEHP or 1)) }
+	end
+	local added, removed, masteryChanges = {}, {}, {}
+	for id, node in pairs(spec.allocNodes) do
+		if not origSpec.allocNodes[id] and node.type ~= "Mastery" then added[#added + 1] = node.dn end
+	end
+	for id, node in pairs(origSpec.allocNodes) do
+		if not spec.allocNodes[id] and node.type ~= "Mastery" then removed[#removed + 1] = node.dn end
+	end
+	table.sort(added)
+	table.sort(removed)
+	local function effectText(effectId)
+		local effect = effectId and tree.masteryEffects[effectId]
+		return effect and table.concat(effect.sd or {}, " / ")
+	end
+	local seenMastery = {}
+	for _, selections in ipairs({ spec.masterySelections, origSpec.masterySelections }) do
+		for id, effectId in pairs(selections) do
+			if not seenMastery[id] then
+				seenMastery[id] = true
+				local was, now = origSpec.masterySelections[id], spec.masterySelections[id]
+				if was ~= now then
+					masteryChanges[#masteryChanges + 1] = { mastery = spec.nodes[id].name, from = effectText(was), to = effectText(now) }
+				end
+			end
+		end
+	end
+	local used = spec:CountAllocNodes()
+	return { improved = true, spec = spec.title, specIndex = #tab.specList, originalSpec = origSpec.title or "Default",
+		pointsUsed = used, budget = budget, added = added, removed = removed, masteryChanges = masteryChanges,
+		before = summary(before), after = summary(after), dpsFloorMet = (after.SkillTotalDPS or 0) >= floor,
+		skillTotal = { combined = components ~= nil, components = components },
+		warnings = warnings, feasible = feasible, unsourcedConfig = unsourced,
+		rounds = rounds, calcs = ncalcs, seconds = os.clock() - t0 }
+end
+
+function methods.optimize_tree(p)
+	local b = env().build
+	if not b then return { error = "no build loaded" } end
+	local c = chat()
+	local sliceEnd = 0
+	local function pace() if os.clock() >= sliceEnd then coroutine.yield() end end
+	local function progress(text)
+		if c.thinking then c.thinking.steps[#c.thinking.steps + 1] = text end
+	end
+	local co = coroutine.create(function() return optimizeTree(b, p, progress, pace) end)
+	return { _defer = function()
+		sliceEnd = os.clock() + OPT_SLICE
+		local ok, res = coroutine.resume(co)
+		if not ok then error(res, 0) end
+		if coroutine.status(co) == "dead" then return res end
+	end }
 end
 
 local function handle(line)
