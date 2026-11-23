@@ -18,12 +18,13 @@ plus flask Maim/Hinder immunity in `ModParser.lua`/`ModCache.lua`.
 Keep these small; they are where upstream merges conflict.
 
 ## Bridge methods
-`ping, reload, restart, list_sources, search, inspect, get_state, what_if, rank_options, path_cost, compare_variants, parse_mod,
+`ping, reload, restart, list_sources, search, inspect, get_state, what_if, gem_what_if, rank_options, path_cost, compare_variants, parse_mod,
 list_stats, probe_batch, find_by_effect, effect_stats, import_character, optimize_tree, eval (dev mode), chat_wait, chat_reply,
 chat_status, chat_history`. The agent's tools and their parameters are in `agent/api/tools.mjs`.
 
 - `what_if` adds the mods as a temporary Config custom-mod block, recalculates, diffs `calcsTab.mainOutput` and removes
   the block. When a mod's requirements aren't met as configured, `ifConditionsMet` recalculates with them forced on.
+- `gem_what_if` adds or sets gems in a socket group, recalculates and restores it. A gem without a level gets its `naturalMaxLevel`; levels above it are marked `needsCorruption`.
 - `rank_options` runs `what_if` on every search hit and ranks by a weighted relative change of the goal stats.
 - `find_by_effect` uses the effect index: each distinct mod line probed once, keyed by the output stats it moves.
 - `chat_wait` holds the connection open until the panel has a message; the agent loop is
