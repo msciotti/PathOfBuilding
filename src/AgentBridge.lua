@@ -462,6 +462,15 @@ local function evalMods(b, lines, extra, totalsFor)
 	return ok, after, totals, components
 end
 
+local function partsDiff(before, after)
+	if not (before and after) then return nil end
+	local parts = { combined = true, components = {} }
+	for i, c in ipairs(before) do
+		parts.components[i] = { part = c.part, name = c.name, before = c.dps, after = after[i].dps }
+	end
+	return parts
+end
+
 local function mainSkill(b)
 	local env_ = b.calcsTab and b.calcsTab.mainEnv
 	return env_ and env_.player and env_.player.mainSkill
@@ -655,13 +664,7 @@ function methods.what_if(p)
 			note = "Parsed but no output stat changed: the build may already have this effect (check `current` via stats) or it isn't shown in calc output."
 		end
 	end
-	local totalParts
-	if baseComponents and afterComponents then
-		totalParts = { combined = true, components = {} }
-		for i, c in ipairs(baseComponents) do
-			totalParts.components[i] = { part = c.part, name = c.name, before = c.dps, after = afterComponents[i].dps }
-		end
-	end
+	local totalParts = partsDiff(baseComponents, afterComponents)
 	return { applied = lines, changed = diff, skillTotal = totalParts, current = current, requires = #reqs > 0 and reqs or nil,
 		ifConditionsMet = met, modTotals = totals, socketedAppliedTo = #socketedInfo > 0 and socketedInfo or nil, changedOther = changedOther, capped = #capped > 0 and capped or nil, unsupported = #unsupported > 0 and unsupported or nil, restored = ok2, note = note }
 end
@@ -1087,6 +1090,77 @@ function methods.effect_stats(p)
 	end
 	return { probed = c, unsupportedByParser = unsupported, conditional = conditional, noEffect = noeff, errors = errs,
 		statsMoved = statCounts }
+end
+
+function methods.gem_what_if(p)
+	local b = env().build
+	if not b then return { error = "no build loaded" } end
+	local group = b.skillsTab.socketGroupList[p.group or b.mainSocketGroup]
+	if not group then return { error = "no such socket group" } end
+	local base, baseComponents = currentStats(b)
+	local want
+	if p.stats then want = {} for _, k in ipairs(p.stats) do want[k] = true end end
+	local original, saved, used = {}, {}, {}
+	for i, g in ipairs(group.gemList) do
+		original[i] = g
+		saved[g] = { level = g.level, quality = g.quality }
+	end
+	local function restore()
+		group.gemList = {}
+		for i, g in ipairs(original) do
+			group.gemList[i] = g
+			g.level, g.quality = saved[g].level, saved[g].quality
+		end
+		b.skillsTab:ProcessSocketGroup(group)
+	end
+	local function find(name)
+		for i, g in ipairs(group.gemList) do
+			if g.nameSpec:lower() == name:lower() then return g, i end
+		end
+	end
+	for _, c in ipairs(p.gems or {}) do
+		local gem, at = find(c.name)
+		local was = gem and { level = gem.level, quality = gem.quality }
+		local action = gem and "set" or "added"
+		local replaced
+		if c.replace then
+			local old, oldAt = find(c.replace)
+			if not old then
+				restore()
+				return { error = c.replace .. " is not in the socket group" }
+			end
+			replaced = old.nameSpec
+			gem = { nameSpec = c.name, enabled = old.enabled, enableGlobal1 = true, enableGlobal2 = true, count = 1, qualityId = "Default" }
+			group.gemList[oldAt] = gem
+			was, action = nil, "replaced"
+		elseif not gem then
+			gem = { nameSpec = c.name, enabled = true, enableGlobal1 = true, enableGlobal2 = true, count = 1, qualityId = "Default" }
+			table.insert(group.gemList, gem)
+		end
+		gem.level, gem.quality = c.level or 1, c.quality or 20
+		used[#used + 1] = { gem = gem, was = was, action = action, replaced = replaced }
+		b.skillsTab:ProcessSocketGroup(group)
+		if gem.errMsg then
+			local err = gem.errMsg
+			restore()
+			return { error = c.name .. ": " .. err }
+		end
+		if not c.level then
+			gem.level = gem.gemData.naturalMaxLevel
+			b.skillsTab:ProcessSocketGroup(group)
+		end
+	end
+	local ok, after, _, components = evalMods(b, {})
+	local gems = {}
+	for _, u in ipairs(used) do
+		local max = u.gem.gemData.naturalMaxLevel
+		gems[#gems + 1] = { name = u.gem.nameSpec, action = u.action, replaced = u.replaced, level = u.gem.level, quality = u.gem.quality,
+			naturalMaxLevel = max, needsCorruption = (u.gem.level > max or u.gem.quality > 20) or nil, was = u.was }
+	end
+	restore()
+	local restored = pcall(recalc, b)
+	if not ok then return { error = tostring(after) } end
+	return { gems = gems, changed = diffStats(base, after, want), skillTotal = partsDiff(baseComponents, components), restored = restored }
 end
 
 function methods.import_character(p)
