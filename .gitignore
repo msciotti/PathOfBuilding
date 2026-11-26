@@ -46,3 +46,5 @@ runtime/SimpleGraphic/Screenshots
 .emmyrc.json
 .luarc.json
 agent_effects.json
+agent/mcp/node_modules/
+agent/tools/__pycache__/
