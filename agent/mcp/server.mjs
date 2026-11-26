@@ -36,7 +36,36 @@ const TOOLS = [
   { name: "pob_what_if", method: "what_if",
     description: "Evaluate hypothetical mod text on the open build using PoB's own calc engine, without changing the build. Pass mod lines as they appear in game (e.g. 'Cannot be Poisoned', '+50 to maximum Life'); returns before/after for every stat that changed. Optionally filter with `stats`.",
     inputSchema: { type: "object", properties: { mods: strs, stats: strs }, required: ["mods"] } },
+  { name: "pob_export_build", method: "export_build",
+    description: "Equipped items (slot, rarity, base, links, raw text) and socketed gems (level, quality, corrupted, item-granted) of the open build. Use before reasoning about gear or swap cost.",
+    inputSchema: { type: "object", properties: {} } },
+  { name: "pob_trade_queries", method: "trade_queries",
+    description: "Official-trade-site search queries for each equipped rare/magic item and each variable-mod unique (Watcher's Eye, Balance of Terror...), built with PoB's own Buy-Similar matcher. Each mod carries a per-mod query fragment and an `impact` score = how much the build loses (DPS/EHP/life/resists/attributes) if that mod is removed; use the high-impact mods as the 'key mods' to search on. Bench crafts are excluded. Mins = roll x `looseness` (0.8).",
+    inputSchema: { type: "object", properties: { looseness: { type: "number" }, maxMods: int, slots: strs, impact: { type: "boolean" } } } },
+  { name: "pob_variable_uniques", method: "variable_uniques",
+    description: "List uniques in PoB's database whose mods are rolled from a pool (so poe.ninja's single price is wrong for them and real listings with the rolled mods must be priced).",
+    inputSchema: { type: "object", properties: {} } },
 ];
+
+// build_cost runs outside PoB (network pricing), so it's a local subprocess rather than a bridge method.
+import { execFile } from "node:child_process";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+const BUILD_COST = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "tools", "build_cost.py");
+TOOLS.push({ name: "pob_build_cost", local: true,
+  description: "Estimate what it costs to BUY the build open in Path of Building (swap cost). Uniques + gems from poe.ninja; variable-mod uniques, rares and cluster jewels from real trade listings (rares on their highest-impact mods, needing a real market of >= minListings); magic flasks at normal-base price. Returns per-slot chaos price, low/high, confidence, source, trade URL and the mods searched, plus totals in chaos and divine. Trade calls need a residential IP (GGG blocks datacenters); ~2-5 min on a cold cache due to rate limits. noTrade=true for a fast ninja-only estimate.",
+  inputSchema: { type: "object", properties: { league: str, looseness: { type: "number" }, listings: int, minListings: int, maxKey: int, noTrade: { type: "boolean" } } } });
+function runBuildCost(a) {
+  const args = [BUILD_COST, "--json"];
+  if (a.league) args.push("--league", a.league);
+  if (a.looseness) args.push("--looseness", String(a.looseness));
+  if (a.listings) args.push("--listings", String(a.listings));
+  if (a.minListings) args.push("--min-listings", String(a.minListings));
+  if (a.maxKey) args.push("--max-key", String(a.maxKey));
+  if (a.noTrade) args.push("--no-trade");
+  return new Promise((resolve) => execFile("python3", args, { timeout: 600000, maxBuffer: 1 << 24 }, (err, out, errOut) =>
+    resolve(err ? { error: String(errOut || err.message) } : { result: JSON.parse(out) })));
+}
 
 const server = new Server({ name: "pob-agent", version: "0.1.0" }, { capabilities: { tools: {} } });
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -46,7 +75,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const tool = TOOLS.find((t) => t.name === req.params.name);
   if (!tool) return { isError: true, content: [{ type: "text", text: "unknown tool" }] };
   try {
-    const r = await rpc(tool.method, req.params.arguments || {});
+    const r = tool.local ? await runBuildCost(req.params.arguments || {}) : await rpc(tool.method, req.params.arguments || {});
     return { isError: !!r.error, content: [{ type: "text", text: JSON.stringify(r.error ?? r.result) }] };
   } catch (e) {
     return { isError: true, content: [{ type: "text", text: String(e.message) }] };

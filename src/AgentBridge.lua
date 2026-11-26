@@ -133,6 +133,268 @@ function methods.get_state()
 	}
 end
 
+-- Export the equipped gear + gems of the loaded build for pricing (build_cost).
+-- Returns { items = [{slot, name, base, rarity, raw, corrupted, sockets, links, ilvl, modLines}], gems = [{name, level, quality, support, enabled}] }
+function methods.export_build()
+	local b = env().build
+	if not b then return { error = "no build loaded" } end
+	local it = b.itemsTab
+	local out, seen = { items = {}, gems = {} }, {}
+	local function lines(list)
+		local t = {}
+		for _, l in ipairs(list or {}) do if l.line then t[#t + 1] = l.line end end
+		return t
+	end
+	for _, slot in ipairs(it.orderedSlots) do
+		local id = slot.selItemId
+		local shown = true
+		if slot.shown then local ok, v = pcall(slot.shown, slot) shown = (not ok) or v end
+		local item = id and id ~= 0 and it.items[id]
+		if item and shown and not seen[id] and not slot.inactive then
+			seen[id] = true
+			local maxLink, cur, prevGroup = 0, 0, nil
+			for _, s in ipairs(item.sockets or {}) do
+				if s.group == prevGroup then cur = cur + 1 else cur = 1 prevGroup = s.group end
+				if cur > maxLink then maxLink = cur end
+			end
+			out.items[#out.items + 1] = {
+				slot = slot.slotName, name = item.title or item.name, base = item.baseName,
+				rarity = item.rarity, type = item.type, corrupted = item.corrupted or false,
+				sockets = #(item.sockets or {}), links = maxLink, ilvl = item.itemLevel,
+				quality = item.quality, influence = project(item.influence or {}, 1, {}, 20),
+				implicitLines = lines(item.implicitModLines), explicitLines = lines(item.explicitModLines),
+				enchantLines = lines(item.enchantModLines), craftedLines = (function()
+					local t = {} for _, l in ipairs(item.explicitModLines or {}) do if l.crafted then t[#t + 1] = l.line end end return t end)(),
+				raw = item:BuildRaw(),
+			}
+		end
+	end
+	for _, g in ipairs(b.skillsTab.socketGroupList or {}) do
+		for _, gem in ipairs(g.gemList or {}) do
+			local gd = gem.gemData
+			if gd then
+				out.gems[#out.gems + 1] = {
+					name = gd.name or gem.nameSpec, level = gem.level, quality = gem.quality,
+					support = gd.grantedEffect and gd.grantedEffect.support or false,
+					enabled = gem.enabled ~= false and g.enabled ~= false, group = g.label or g.slot,
+					corrupted = gem.corrupted or false,
+					-- non-nil source = granted by an item/config (not a gem you buy)
+					source = g.source and tostring(g.source) or nil,
+				}
+			end
+		end
+	end
+	return out
+end
+
+-- Trade-site stat catalogue bundled with PoB (Data/TradeSiteStats.lua), flattened for mod-line -> stat-id matching.
+function methods.trade_stats()
+	local cats = LoadModule("Data/TradeSiteStats")
+	local out = {}
+	for _, cat in ipairs(cats or {}) do
+		for _, e in ipairs(cat.entries or {}) do
+			out[#out + 1] = { id = e.id, text = e.text, type = e.type, hasOptions = e.option ~= nil }
+		end
+	end
+	return { count = #out, stats = out }
+end
+
+-- Per-mod build impact: remove each mod line from a copy of the item, recalc with PoB's misc calculator,
+-- and report the relative loss in key outputs. Bigger loss = more "key" to the build = must be searched for.
+local IMPACT_STATS = { "CombinedDPS", "TotalEHP", "Life", "EnergyShield", "Mana",
+	"FireResist", "ColdResist", "LightningResist", "ChaosResist", "Str", "Dex", "Int", "EffectiveMovementSpeedMod" }
+local function modImpacts(b, slotName, item)
+	local calcFunc, base = b.calcsTab:GetMiscCalculator()
+	local res = {}
+	for _, listName in ipairs({ "implicitModLines", "explicitModLines" }) do
+		for idx, ml in ipairs(item[listName] or {}) do
+			if not ml.crafted then
+				local copy = new("Item"):Item(item:BuildRaw())
+				table.remove(copy[listName], idx)
+				copy:BuildAndParseRaw()
+				local ok, out = pcall(calcFunc, { repSlotName = slotName, repItem = copy }, false)
+				if ok and out then
+					local loss, worst = {}, 0
+					for _, s in ipairs(IMPACT_STATS) do
+						local bv, nv = tonumber(base[s]) or 0, tonumber(out[s]) or 0
+						if bv ~= 0 and nv < bv then
+							local frac = (bv - nv) / math.abs(bv)
+							-- resist/attribute holes are worse than they look: dropping below cap/req breaks a build
+							if s:match("Resist$") and (tonumber(out[s]) or 0) < 75 and bv >= 75 then frac = frac * 3 end
+							if (s == "Str" or s == "Dex" or s == "Int") and out[s .. "RequiredMissing"] then frac = frac * 3 end
+							loss[s] = math.floor(frac * 1000 + 0.5) / 10
+							if frac > worst then worst = frac end
+						end
+					end
+					local line = ml.range and itemLib.applyRange(ml.line, ml.range, ml.valueScalar) or ml.line
+					res[line] = { score = math.floor(worst * 1000 + 0.5) / 10, loss = loss }
+				end
+			end
+		end
+	end
+	return res
+end
+
+-- Uniques whose mods are picked from a pool (Watcher's Eye, Balance of Terror, Megalomaniac, Forbidden Flame/Flesh,
+-- Impossible Escape, Voranas...): PoB models those as variants. Version variants ("Pre 3.19", "Current") are NOT mod pools.
+local function isVersionName(n)
+	n = tostring(n or "")
+	return n:match("^Pre ") or n:match("^Current") or n:match("%d+%.%d+") or n:match("^None$") or n:match("Legacy")
+end
+local function variableUniqueLines(item)
+	-- Equipped items are parsed from the character import (no variant metadata), so consult PoB's unique DB
+	-- template: if the template's mod lines are gated by non-version variants, the unique rolls from a pool.
+	if not (item.rarity == "UNIQUE" or item.rarity == "RELIC") then return nil end
+	local db = main and main.uniqueDB and main.uniqueDB.byTitle
+	local tpl = db and db[(item.title or ""):lower()]
+	if not tpl or not tpl.variantList or #tpl.variantList < 2 then return nil end
+	local pool = tpl.hasAltVariant
+	if not pool then
+		local n = 0
+		for _, v in ipairs(tpl.variantList) do if not isVersionName(v) then n = n + 1 end end
+		pool = n >= 3
+	end
+	if not pool then return nil end
+	-- Mods that exist on every variant of the template are fixed; everything else on our item is a rolled pick.
+	local fixed = {}
+	for _, l in ipairs(tpl.explicitModLines or {}) do
+		if not l.variantList then fixed[(l.line or ""):gsub("%(%-?[%d%.]+%-%-?[%d%.]+%)", "#"):gsub("%-?%d+%.?%d*", "#")] = true end
+	end
+	local lines = {}
+	for _, l in ipairs(item.explicitModLines or {}) do
+		local norm = (l.line or ""):gsub("%-?%d+%.?%d*", "#")
+		if not fixed[norm] then lines[#lines + 1] = l end
+	end
+	return #lines > 0 and lines or nil, tpl
+end
+
+-- Debug/audit: which uniques in PoB's DB count as variable-mod (mod-pool) uniques?
+function methods.variable_uniques()
+	local db = main and main.uniqueDB and main.uniqueDB.list or {}
+	local out = {}
+	for _, tpl in pairs(db) do
+		local fake = { rarity = "UNIQUE", title = tpl.title, explicitModLines = {} }
+		local lines = variableUniqueLines(fake)
+		-- variableUniqueLines returns nil with an empty item; detect via the template test directly
+		local pool = false
+		if tpl.variantList and #tpl.variantList >= 2 then
+			if tpl.hasAltVariant then pool = true else
+				local n = 0
+				for _, v in ipairs(tpl.variantList) do if not isVersionName(v) then n = n + 1 end end
+				pool = n >= 3
+			end
+		end
+		if pool then out[#out + 1] = tpl.title .. " (" .. #tpl.variantList .. " variants" .. (tpl.hasAltVariant and ", pick-many" or "") .. ")" end
+	end
+	table.sort(out)
+	return { count = #out, uniques = out }
+end
+
+-- Build "buy similar" trade-site queries for each equipped rare/magic item, reusing PoB's own
+-- Compare-tab matcher (CompareBuySimilar.addModEntries -> trade stat ids). Mod minimums are scaled by
+-- `looseness` (default 0.8) so the search finds "roughly as good" items.
+-- params: { looseness = 0.8, maxMods = 6, slots = {"Gloves", ...} (optional) }
+function methods.trade_queries(p)
+	local b = env().build
+	if not b then return { error = "no build loaded" } end
+	local loose = tonumber(p.looseness) or 0.8
+	local maxMods = tonumber(p.maxMods) or 12
+	local want
+	if p.slots then want = {} for _, s in ipairs(p.slots) do want[s] = true end end
+	local cbs = require("Classes.CompareBuySimilar")
+	local tradeHelpers = require("Classes.TradeHelpers")
+	local it = b.itemsTab
+	local out, seen = {}, {}
+	for _, slot in ipairs(it.orderedSlots) do
+		local id = slot.selItemId
+		local item = id and id ~= 0 and it.items[id]
+		local shown = true
+		if slot.shown then local ok, v = pcall(slot.shown, slot) shown = (not ok) or v end
+		local varLines = item and variableUniqueLines(item)
+		if item and shown and not seen[id] and (not want or want[slot.slotName])
+			and (item.rarity == "RARE" or item.rarity == "MAGIC" or varLines) then
+			seen[id] = true
+			local entries = varLines and cbs.addModEntries(item, { { list = varLines, type = "explicit" } }) or cbs.addModEntries(item, {
+				{ list = item.enchantModLines, type = "enchant" },
+				{ list = item.implicitModLines, type = "implicit" },
+				{ list = (function()
+					-- bench-crafted mods are cheap to re-craft after buying: don't pay for them in the search
+					local t = {} for _, l in ipairs(item.explicitModLines or {}) do if not l.crafted then t[#t + 1] = l end end return t end)(),
+					type = "explicit" },
+				{ list = item.scourgeModLines, type = "scourge" },
+			})
+			local impacts = (p.impact ~= false) and item.rarity == "RARE" and modImpacts(b, slot.slotName, item) or nil
+			local cands, skipped = {}, {}
+			for _, e in ipairs(entries) do
+				local text = table.concat(e.formattedLines or {}, " / "):gsub("%^x%x%x%x%x%x%x", ""):gsub("%^%d", "")
+				if #e.tradeIds == 0 then
+					skipped[#skipped + 1] = text
+				else
+					local raw = (e.formattedLines and #e.formattedLines == 1) and text or nil
+					cands[#cands + 1] = { e = e, text = text, raw = raw, mag = math.abs(tonumber(e.value) or 0) }
+				end
+			end
+			-- Prefer explicit mods (what you actually pay for), then larger magnitudes; keep up to maxMods.
+			table.sort(cands, function(a, c)
+				local ra, rc = (a.e.type == "explicit") and 0 or 1, (c.e.type == "explicit") and 0 or 1
+				if ra ~= rc then return ra < rc end
+				return a.mag > c.mag
+			end)
+			local stats = { { type = "and", filters = {} } }
+			local used = {}
+			for i, c in ipairs(cands) do
+				if i > maxMods then skipped[#skipped + 1] = c.text .. " (over maxMods)" else
+					local e = c.e
+					local function filt(tid)
+						local f = { id = tid }
+						if e.isOption then
+							f.value = tid:match("timeless") and { min = e.value, max = e.value } or { option = e.value }
+						elseif e.value then
+							local v = e.value * loose
+							v = (v >= 0) and math.floor(v) or math.ceil(v)
+							if e.invert then f.value = { max = -v } else f.value = { min = v } end
+						end
+						return f
+					end
+					if #e.tradeIds == 1 then
+						table.insert(stats[1].filters, filt(e.tradeIds[1]))
+					else
+						local cf = { type = "count", value = { min = 1 }, filters = {} }
+						for _, tid in ipairs(e.tradeIds) do table.insert(cf.filters, filt(tid)) end
+						table.insert(stats, cf)
+					end
+					-- per-mod fragment so callers can search arbitrary mod subsets
+					local frag
+					if #e.tradeIds == 1 then frag = { kind = "and", filter = filt(e.tradeIds[1]) }
+					else
+						local fl = {} for _, tid in ipairs(e.tradeIds) do fl[#fl + 1] = filt(tid) end
+						frag = { kind = "count", filters = fl }
+					end
+					local imp = impacts and (impacts[c.raw] or impacts[c.text]) or nil
+					used[#used + 1] = { text = c.text, type = e.type, value = e.value, tradeIds = e.tradeIds,
+						frag = frag, impact = imp and imp.score or 0, impactLoss = imp and imp.loss or nil }
+				end
+			end
+			local cat = tradeHelpers.getTradeCategory(slot.slotName, item)
+			local filters = { type_filters = { filters = { rarity = { option = "nonunique" } } } }
+			if cat then filters.type_filters.filters.category = { option = cat } end
+			local q = { query = { status = { option = "securable" }, stats = stats, filters = filters }, sort = { price = "asc" } }
+			if varLines then
+				-- variable-mod unique: search this exact unique with its rolled pool mods
+				q.query.name = item.title or item.name
+				q.query.type = item.baseName
+				q.query.filters = { type_filters = { filters = { rarity = { option = "unique" } } } }
+			end
+			-- Cluster jewels: pin the base type (notables are only meaningful per size).
+			if item.baseName and item.baseName:find("Cluster Jewel") then q.query.type = item.baseName end
+			out[#out + 1] = { slot = slot.slotName, name = item.title or item.name, base = item.baseName,
+				rarity = item.rarity, ilvl = item.itemLevel, query = q, mods = used, unmatched = skipped,
+				variableUnique = varLines and true or nil }
+		end
+	end
+	return { looseness = loose, items = out }
+end
+
 local function snapshot(out)
 	local t = {}
 	for k, v in pairs(out) do if type(v) == "number" then t[k] = v end end
@@ -394,6 +656,17 @@ local function handle(line)
 	return { id = req.id, result = res }
 end
 M.handle = handle
+
+-- Hot-reload fix: the original module's `methods` (launch.agent.methods) is the table the socket
+-- handler dispatches from. Older reloads copied into a stale fresh table, so on (re)load we always
+-- sync our definitions into the live one.
+do
+	local live = launch and launch.agent and launch.agent.methods
+	if live and live ~= methods then
+		for k in pairs(live) do live[k] = nil end
+		for k, v in pairs(methods) do live[k] = v end
+	end
+end
 
 local server, clients = nil, {}
 function M.start()

@@ -12,7 +12,8 @@ Personal patch on PathOfBuildingCommunity/PathOfBuilding v2.68.1 (PoE1). Goal: l
 
 ## Bridge methods
 `ping, reload, list_sources, search{query,sources,slot,limit,exact}, inspect{path,depth,maxKeys}, get_state,
-what_if{mods,stats}, rank_options{query,goal,roll,max,top,stats}, probe_batch{budget}, find_by_effect{stat,direction,...}, effect_stats`.
+what_if{mods,stats}, rank_options{query,goal,roll,max,top,stats}, probe_batch{budget}, find_by_effect{stat,direction,...}, effect_stats,
+export_build, trade_queries, trade_stats, variable_uniques`.
 - `what_if` adds a temporary Config custom-mod block (`configSets[active].customModsList`), recalcs, diffs `calcsTab.mainOutput`, removes the block.
 - `rank_options` = search -> what-if each hit -> rank by weighted relative stat change. Lower tiers of the same mod group are skipped at roll=max.
 - `probe_batch`/`find_by_effect` = **effect index** (the "go in reverse" idea): probe each distinct normalised mod line once, cache which output stats it moves
@@ -24,6 +25,16 @@ what_if{mods,stats}, rank_options{query,goal,roll,max,top,stats}, probe_batch{bu
 - what_if ignores slot/cost/item-level rules; `spawnOn` from data is the only slot signal.
 - Not done: in-app chat tab (plan: `Classes/AgentTab.lua` modelled on NotesTab + `launch:DownloadPage` to a local agent), wiring Hermes (deliberately kept local to PoB).
 - `LoadModule` caches; `reload` uses `loadfile` relative to PoB's working dir.
+
+## Build cost (swap-cost estimator) — skill: `agent/skills/build-cost/SKILL.md`
+- Bridge: `export_build` (equipped items + gems), `trade_queries{looseness,maxMods,slots,impact}` (PoB's
+  `CompareBuySimilar.addModEntries` → trade stat ids; per-mod impact = build loss when the mod is removed;
+  bench crafts dropped; variable-mod uniques included), `variable_uniques` (mod-pool uniques from PoB's unique DB),
+  `trade_stats` (flattened TradeSiteStats).
+- `agent/tools/build_cost.py [--league X] [--looseness 0.8] [--min-listings 10] [--max-key 4] [--json] [--no-trade]`
+  → MCP `pob_build_cost`. poe.ninja for uniques/gems; official trade API for rares/clusters/variable uniques/flask bases.
+- Needs a residential IP for trade (GGG 403s datacenters). `POE_TRADE_BASE` overrides the API host (e.g. a mock).
+- `reload` now syncs new defs into `launch.agent.methods` (the table the socket dispatches from).
 
 ## Run it
 Windows/Mac/Linux: run PoB from this tree (`src/`), build loaded, then `python3 agent/tools/rpc.py ping`.
